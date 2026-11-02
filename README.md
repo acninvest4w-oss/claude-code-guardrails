@@ -48,6 +48,9 @@ How it closes the usual ways an agent "passes" tests:
 - **Broken test command** (wrong cwd, no tests collected) -> exit codes outside
   `--red-codes` abort before burning a fixer call. So does `--protect` matching nothing.
 - **Auth/API failure** -> abort after one round instead of looping on an error.
+- **Something hangs** -> `--test-timeout` / `--fixer-timeout` (default 30 min each) kill
+  the whole process tree, not just the shell, so a grandchild holding the pipes can't
+  stall the gate. `--max-cost` (USD) stops between rounds once the fixer spend reaches it.
 
 The log keeps the tail plus early `Traceback`/`FAILED` lines a plain tail would cut off,
 so the fixer sees the root cause and not just the summary line.
@@ -59,8 +62,10 @@ so the fixer sees the root cause and not just the summary line.
 | 3 | fixer touched protected files (reverted) |
 | 4 | `--expect-red` but already green |
 | 5 | `claude` CLI not on PATH |
-| 6 | fixer call failed (auth/API) |
+| 6 | fixer call failed (auth/API) or timed out |
 | 7 | bad setup: test command crashed or `--protect` matched nothing |
+| 8 | test command timed out (process tree killed) |
+| 9 | `--max-cost` reached before green |
 
 `--check` runs the tests once with no fixer, for CI or a quick verdict.
 Full logs go to a temp dir; the console only gets ASCII status lines.
@@ -79,11 +84,12 @@ So `guard.js` splits by event:
 
 | Rule id | Type | What | Why it exists |
 |---|---|---|---|
-| `git-add-all` | block | `git add -A` / `--all` / `.` without `--dry-run` | stages `.env`, keys and data dumps along with the change |
+| `git-add-all` | block | `git add -A` / `--all` / `.` / `*` / `:/` without `-n`/`--dry-run`, checked per chained command (`;` `&&` `\|\|` `\|` `&`), with `git -C`/`-c` prefixes | stages `.env`, keys and data dumps along with the change |
 | `gpg-commit` | block | `git commit` while `commit.gpgsign=true` | the signing prompt hung the agent terminal |
-| `readonly-dir` | block | edits under a `readonly` dir | cloned reference repos are for reading; patterns get copied out, not patched in place |
+| `guard-config` | block | edits to `.claude/guardrails.json`, `.claude/settings*.json` or `guard.js` itself | the agent must not switch its own guard off |
+| `readonly-dir` | block | edits under a `readonly` dir, after resolving `..` and symlinks/junctions | cloned reference repos are for reading; patterns get copied out, not patched in place |
+| `secret` | block | hardcoded keys/tokens (OpenAI, Anthropic, Gemini, GitHub, Slack, Telegram, Bearer); `.env` / `.env.*` exempt | a key pasted into code ends up in git history; blocked before it touches disk |
 | `logger-non-ascii` | block | non-ASCII in Python `logger.*()` | emoji in a log line crashed async tasks on a cp1252 Windows VPS, 5+ times |
-| `secret` | warn | hardcoded keys/tokens (OpenAI, Anthropic, Gemini, GitHub, Slack, Telegram, Bearer); `.env*` skipped | a key pasted into code ends up in git history |
 | `broad-except-py` | warn | `except Exception` in Python | a blanket catch hides the error you need when something breaks |
 | `empty-catch-js` | warn | empty `catch {}` in JS/TS | same failure in JS: the error just disappears |
 | `telegram-parse-mode` | warn | Telegram send with `&lt;` entities but no `parse_mode=HTML` | users of a scanner bot saw raw `&lt;b&gt;`, more than once |
@@ -118,6 +124,23 @@ applies to, an optional file regex, and a `check` that returns a message or noth
 Bad hook input or a broken config file fails open: a bug in the guard never blocks
 your tools.
 
+### What this is not
+
+A seatbelt against agent mistakes, not a sandbox against an adversary.
+
+- It reads `Edit`/`Write`/`MultiEdit` input and the Bash **command string**. A shell
+  redirect (`echo key > file`), `sed -i`, or a script the agent writes and runs are not
+  parsed. For hard file boundaries use `permissions.deny` (e.g. `Edit(./vendor/**)`) and
+  Claude Code's sandbox; this hook adds the *explanation* the model needs to stop retrying.
+- `GUARDRAILS_OFF` / `GUARDRAILS_READONLY` come from the environment Claude Code was
+  started with. An `export` inside the agent's Bash tool does not reach the hook.
+- Fail-open is deliberate: a crashing guard that blocked every tool call would be
+  switched off by its user within a day.
+
+Bypass attempts are tested in [`hooks/tests/guard.test.js`](hooks/tests/guard.test.js)
+("red team"): `..` traversal, junction/symlink into a read-only dir, `git add -A --dry-run;
+git add -A`, `git -C sub add -A`, quoted and subshell forms, edits to the guard's own config.
+
 **Windows:** each hook spawns `node` in a new console, so a window flashes on every
 tool call. [`hooks/hide.py`](hooks/hide.py) runs it under `pythonw` with
 `CREATE_NO_WINDOW`; see [`examples/settings.windows.json`](examples/settings.windows.json).
@@ -146,9 +169,14 @@ write failing test -> test_gate.py --expect-red -> green -> reviewer -> fix P1s 
 ```bash
 python -m pytest -q gate/tests        # real pytest subprocesses, fake fixer
 node --test hooks/tests/guard.test.js
+python e2e/smoke.py --model haiku     # real claude CLI, a few cents
 ```
 
-CI runs both on Ubuntu and Windows.
+CI runs the unit tests on Ubuntu and Windows on every push. The end-to-end smoke test
+([`e2e/smoke.py`](e2e/smoke.py)) runs the real CLI: hooks wired into a throwaway project
+with Claude asked to break each rule (verdicts read from the filesystem and git index,
+not from the model's reply), then the gate fixing a real bug with the test file checked
+byte-for-byte. It runs on demand via the `e2e` workflow with an `ANTHROPIC_API_KEY` secret.
 
 ## Tiếng Việt
 
