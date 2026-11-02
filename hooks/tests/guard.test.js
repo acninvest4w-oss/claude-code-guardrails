@@ -470,3 +470,215 @@ test('red team: the secret check also covers Edit and MultiEdit text', () => {
   assert.match(checkPre(edit, opts())[0], /GitHub PAT/);
   assert.match(checkPre(multi, opts())[0], /GitHub PAT/);
 });
+
+// PowerShell tool (Claude Code on Windows): the same block rules, PowerShell syntax.
+const ps = (command, cwd) => ({ tool_name: 'PowerShell', tool_input: { command }, ...(cwd ? { cwd } : {}) });
+const idsOf = (out) => out.map((m) => m.match(/^\((.+?)\)/)[1]);
+
+test('powershell: git add -A and signed commits are checked in the PowerShell tool too', () => {
+  for (const cmd of ['git add -A', 'git add .', '& git add --all', "& 'C:\\Program Files\\Git\\cmd\\git.exe' add -A",
+    'Set-Location sub; git add -A', 'git status && git add .', 'git add `\n  -A', 'git.exe -C E:\\repo add :/']) {
+    assert.deepStrictEqual(idsOf(checkPre(ps(cmd), opts())), ['git-add-all'], cmd);
+  }
+  for (const cmd of ['git add -A --dry-run', 'git add src\\a.py', 'git status', 'git add -n .',
+    "Write-Output 'git add -A'", '# git add -A']) {
+    assert.deepStrictEqual(checkPre(ps(cmd), opts()), [], cmd);
+  }
+  assert.deepStrictEqual(idsOf(checkPre(ps('git commit -m x'), opts({ gpgsign: () => 'true' }))), ['gpg-commit']);
+});
+
+test('powershell: cmdlet and alias writes into read-only dirs are blocked', () => {
+  const cfg = opts({ config: { readonly: ['vendor/'] } });
+  for (const cmd of [
+    "Set-Content vendor\\a.py 'x'", 'Set-Content -Path vendor/a.py -Value x', 'sc -Value x -LiteralPath vendor\\a.py',
+    'Add-Content -Path:vendor\\a.py x', "'x' | Out-File vendor\\log.txt", "'x' | Out-File -FilePath vendor\\l.txt -Encoding utf8",
+    'Remove-Item -Recurse -Force vendor', 'rm -r vendor\\sub', 'del vendor\\a.py', 'ri vendor', 'Remove-Item src\\a.py, vendor\\b.py',
+    'Copy-Item src\\a.py vendor\\', 'Copy-Item -Path src\\a.py -Destination vendor', 'cpi src\\a.py -Dest vendor\\b.py',
+    'Move-Item vendor\\a.py src\\', 'mi -Path vendor -Destination old', 'Rename-Item vendor\\a.py b.py',
+    'New-Item -ItemType File -Path vendor -Name x.py', 'ni vendor\\new.py', 'Clear-Content vendor\\a.py',
+    "'x' | Tee-Object -FilePath vendor\\t.txt", 'echo x > vendor\\a.py', 'Get-ChildItem vendor | Remove-Item',
+    'Remove-Item "vendor\\a b.py"', "Remove-Item 'vendor\\it''s.py'", 'Set-Content `\n  vendor\\a.py x',
+  ]) assert.deepStrictEqual(idsOf(checkPre(ps(cmd), cfg)), ['readonly-dir'], cmd);
+  for (const cmd of [
+    'Get-Content vendor\\a.py > out.txt', 'Copy-Item vendor\\a.py src\\', 'Copy-Item -Path vendor\\a.py -Destination src',
+    'Get-ChildItem vendor -Recurse | Select-Object Name', 'Select-String -Path vendor\\*.py -Pattern x',
+    "Set-Content out.txt 'vendor'", 'Set-Content -Path out.txt -Value vendor', 'Remove-Item build -Recurse -Force',
+    "Write-Host 'rm -r vendor'", "Set-Content notes.md @'\nRemove-Item vendor\ngit add -A\n'@",
+    '<# Remove-Item vendor #> Get-Date', "$env:FOO = 'vendor'; Get-Item $env:FOO",
+  ]) assert.deepStrictEqual(checkPre(ps(cmd), cfg), [], cmd);
+});
+
+test('powershell: the agent cannot switch the guard off from PowerShell', () => {
+  for (const cmd of ['Set-Content .claude\\settings.json {}', "'{}' > .claude/guardrails.json",
+    'Remove-Item .claude -Recurse', 'Copy-Item C:\\tmp\\s.json .claude\\settings.json',
+    'Move-Item .claude\\settings.json saved.json', `Set-Content "${GUARD_ABS}" x`,
+    'Set-Content C:\\repo\\.claude\\settings.json x']) {
+    const out = checkPre(ps(cmd), opts({ env: { CLAUDE_PROJECT_DIR: cmd.includes('C:\\repo') ? 'C:\\repo' : ROOT } }));
+    assert.deepStrictEqual(idsOf(out), ['guard-config'], cmd);
+  }
+});
+
+test('powershell: Set-Location / Push-Location move where writes land, in any scope', (t) => {
+  const { root } = realProject(t);
+  const cfg = opts({ env: { CLAUDE_PROJECT_DIR: root }, config: { readonly: ['vendor/'] } });
+  const run = (cmd) => checkPre(ps(cmd, root), cfg);
+  for (const cmd of ['Set-Location vendor; Set-Content a.py x', "cd vendor; 'x' > a.py", 'Push-Location vendor; ni x.py',
+    '(Set-Location vendor); Set-Content a.py x', '& { cd vendor }; Set-Content a.py x', 'sl -Path vendor; ni x.py',
+    'Set-Location vendor | Out-Null; ni x.py', 'Test-Path x && cd vendor; ni x.py', '$(cd vendor); ni x.py',
+    'if (Test-Path vendor) { Set-Location vendor }; ni x.py', 'cd src; cd -; cd vendor; ni x.py']) {
+    assert.deepStrictEqual(idsOf(run(cmd)), ['readonly-dir'], cmd);
+  }
+  assert.deepStrictEqual(idsOf(checkPre(ps('echo x > a.py', path.join(root, 'vendor')), cfg)), ['readonly-dir']);
+  // a guard file stays reachable from a branch that may not have run
+  assert.deepStrictEqual(idsOf(run('if ($false) { cd src }; Set-Content .claude\\settings.json x')), ['guard-config']);
+  for (const cmd of ['Push-Location vendor; Pop-Location; ni x.py', 'Set-Location vendor; Set-Location ..; ni x.py',
+    'Push-Location; Set-Location src; ni x.py', 'cd vendor; cd ..\\src; ni x.py']) {
+    assert.deepStrictEqual(run(cmd), [], cmd);
+  }
+});
+
+test('powershell: a secret written from PowerShell is blocked, into .env or not written it is not', () => {
+  const key = 'sk-ant-' + 'q'.repeat(30);
+  assert.deepStrictEqual(idsOf(checkPre(ps(`Set-Content config.py "KEY='${key}'"`), opts())), ['secret']);
+  assert.deepStrictEqual(idsOf(checkPre(ps(`"${key}" | Out-File app.js`), opts())), ['secret']);
+  assert.deepStrictEqual(checkPre(ps(`Add-Content .env "KEY=${key}"`), opts()), []);
+  assert.deepStrictEqual(checkPre(ps(`Invoke-RestMethod -Headers @{ Authorization = "Bearer ${'t'.repeat(40)}" } x`), opts()), []);
+});
+
+// Codex design review: PowerShell binding precision.
+test('powershell: wildcards, literal paths, module-qualified names, streams, pipeline input', (t) => {
+  const { root } = realProject(t);
+  const cfg = opts({ env: { CLAUDE_PROJECT_DIR: root }, config: { readonly: ['vendor/'] } });
+  const ids = (cmd) => idsOf(checkPre(ps(cmd, root), cfg));
+  for (const [cmd, id] of [["Remove-Item -Path '.claude\\*'", 'guard-config'], ["Remove-Item '.claude\\s*.json'", 'guard-config'],
+    ['Microsoft.PowerShell.Management\\Set-Content vendor\\a.txt x', 'readonly-dir'], ['git add .\\', 'git-add-all'],
+    ["git add -- '-n' .", 'git-add-all'], ['Get-ChildItem -Path vendor -Filter *.log | Remove-Item', 'readonly-dir'],
+    ['Set-Content -LiteralPath:vendor\\a.txt,src\\b.txt -Value x', 'readonly-dir'], ['SET-CONTENT -PA vendor\\a.txt x', 'readonly-dir'],
+    ['Set-Content vendor\\a.txt -Bogus y x', 'readonly-dir'], ['Remove-Item -UnknownOpt src vendor', 'readonly-dir']]) {
+    assert.deepStrictEqual(ids(cmd), [id], cmd);
+  }
+  for (const cmd of ["Remove-Item -LiteralPath '.claude\\*'", 'Copy-Item vendor\\a.txt src\\a.txt', 'Write-Output x 2>&1',
+    "Set-Content src\\note.txt 'it`s'", 'Get-ChildItem src | Remove-Item', 'Set-Content src\\a.txt x 2>$null']) {
+    assert.deepStrictEqual(ids(cmd), [], cmd);
+  }
+  const key = 'ghp_' + 'a'.repeat(36);
+  assert.deepStrictEqual(ids(`Set-Content .env '${key}'`), []);
+  assert.deepStrictEqual(ids(`Invoke-RestMethod -Headers @{ Authorization = "Bearer ${key}" } x 2>$null`), []);
+  assert.deepStrictEqual(ids(`@'\nTOKEN=${key}\n'@ | Set-Content cfg.txt`), ['secret']);
+});
+
+// Codex review gate, round 1 on the PowerShell side.
+test('powershell: named parameters free positional slots, blocks split commands, location binds', (t) => {
+  const { root } = realProject(t);
+  const cfg = opts({ env: { CLAUDE_PROJECT_DIR: root }, config: { readonly: ['vendor/'] } });
+  const ids = (cmd) => idsOf(checkPre(ps(cmd, root), cfg));
+  for (const [cmd, id] of [
+    ['Copy-Item -Path src\\a.log .claude\\settings.json', 'guard-config'],
+    ['Rename-Item -Path .claude\\old.log settings.json', 'guard-config'],
+    ["try { Set-Content .claude\\settings.json '{}' } catch { }", 'guard-config'],
+    ['. { Set-Content .claude\\settings.json x }', 'guard-config'],
+    ['Set-Location -Path:vendor; Set-Content a.txt x', 'readonly-dir'],
+    ['Push-Location -LiteralPath vendor; ni x.txt', 'readonly-dir'],
+    ['Get-ChildItem vendor | ForEach-Object { Remove-Item $_ }', 'readonly-dir'],
+    ['Get-ChildItem vendor | Where-Object { $_.Length -gt 0 } | Remove-Item', 'readonly-dir'],
+    ['Get-ChildItem vendor | ForEach-Object { Remove-Item $_.FullName -Force }', 'readonly-dir'],
+  ]) assert.deepStrictEqual(ids(cmd), [id], cmd);
+  // PowerShell wildcards match dot-names: * reaches .claude (and vendor)
+  assert.ok(ids("Set-Content -Path '*\\settings.json' -Value '{}'").includes('guard-config'));
+  // measured on pwsh 7.6 and Windows PowerShell 5.1: an unquoted backtick-newline separates
+  // arguments, it does not join "sett" and "ings.json"
+  for (const cmd of ['Set-Content -Path out.txt vendor\\a.txt', 'Add-Content src\\a.log vendor',
+    'Set-Content .claude/sett`\nings.json x', 'Copy-Item -Path vendor\\a.txt src', 'Get-ChildItem src | ForEach-Object { Remove-Item $_ }']) {
+    assert.deepStrictEqual(ids(cmd), [], cmd);
+  }
+  // "$null" is PowerShell's sink only unquoted, and only in PowerShell
+  const nul = opts({ env: { CLAUDE_PROJECT_DIR: root }, config: { readonly: ['$null'] } });
+  assert.deepStrictEqual(idsOf(checkPre(bash("rm -rf '$null'"), nul)), ['readonly-dir']);
+  assert.deepStrictEqual(idsOf(checkPre(ps("Remove-Item '$null'", root), nul)), ['readonly-dir']);
+  assert.deepStrictEqual(checkPre(ps('Get-Date > $null; Get-Date 2>$NULL', root), nul), []);
+});
+
+// Codex review gate, round 2.
+test('powershell: pipeline sources, non-path values, wildcard locations', (t) => {
+  const { root } = realProject(t);
+  const cfg = opts({ env: { CLAUDE_PROJECT_DIR: root }, config: { readonly: ['vendor/'] } });
+  const ids = (cmd) => idsOf(checkPre(ps(cmd, root), cfg));
+  for (const [cmd, want] of [
+    ['Get-ChildItem | Remove-Item -Recurse -Force', ['guard-config', 'readonly-dir']],
+    ['Get-ChildItem -Recurse -Filter settings.json | Remove-Item', ['guard-config', 'readonly-dir']],
+    ['gci -r | Remove-Item', ['guard-config', 'readonly-dir']],
+    ['Get-ChildItem .claude | Remove-Item', ['guard-config']],
+    ['Get-Item -LiteralPath:vendor/a.txt | Remove-Item', ['readonly-dir']],
+    ["'src/a.log','vendor/a.txt' | Remove-Item", ['readonly-dir']],
+    ["Set-Location -Path 'vend*'; Set-Content a.txt x", ['readonly-dir']],
+    ["Remove-Item -Path 'VEND*' -Recurse -Force", ['readonly-dir']],
+  ]) assert.deepStrictEqual(ids(cmd), want, cmd);
+  for (const cmd of ["Set-Content -Encoding utf8 out.txt 'vendor/a.txt'", 'Get-ChildItem -Filter *.log | Remove-Item',
+    'Get-ChildItem .claude -Filter *.log | Remove-Item', 'Get-ChildItem src -Recurse -Include *.log | Remove-Item',
+    "Set-Location -LiteralPath 'vend*'; Set-Content a.txt x", 'Out-File -Encoding utf8 out.txt vendor']) {
+    assert.deepStrictEqual(ids(cmd), [], cmd);
+  }
+});
+
+// Codex review gate, round 3.
+test('powershell: provider-qualified paths, copies into a missing dir, -WhatIf previews', (t) => {
+  const { root } = realProject(t);
+  fs.mkdirSync(path.join(root, 'template'));
+  fs.writeFileSync(path.join(root, 'template', 'settings.json'), '{}');
+  const cfg = opts({ env: { CLAUDE_PROJECT_DIR: root }, config: { readonly: ['vendor/'] } });
+  const ids = (cmd, cwd = root) => idsOf(checkPre(ps(cmd, cwd), cfg));
+  const vendorFile = path.join(root, 'vendor', 'a.txt');
+  assert.deepStrictEqual(ids(`Set-Content -LiteralPath 'FileSystem::${vendorFile}' -Value x`), ['readonly-dir']);
+  assert.deepStrictEqual(ids(`Remove-Item Microsoft.PowerShell.Core\\FileSystem::${vendorFile}`), ['readonly-dir']);
+  assert.deepStrictEqual(ids(`Set-Location FileSystem::${path.join(root, 'vendor')}; ni x.txt`), ['readonly-dir']);
+  const fresh = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'guard-fresh-')));
+  fs.mkdirSync(path.join(fresh, 'template'));
+  fs.writeFileSync(path.join(fresh, 'template', 'settings.json'), '{}');
+  const freshCfg = opts({ env: { CLAUDE_PROJECT_DIR: fresh }, config: {} });
+  assert.deepStrictEqual(idsOf(checkPre(ps('Copy-Item template -Destination .claude -Recurse', fresh), freshCfg)), ['guard-config']);
+  for (const cmd of ['Remove-Item vendor -Recurse -WhatIf', 'Set-Content .claude\\settings.json x -WhatIf',
+    'Copy-Item src\\a.log vendor -wi', 'Copy-Item template dist -Recurse', 'Copy-Item src\\a.log .']) {
+    assert.deepStrictEqual(ids(cmd), [], cmd);
+  }
+  assert.deepStrictEqual(ids('Remove-Item vendor -Recurse -WhatIf:$false'), ['readonly-dir']);
+});
+
+test('unicode-win-script: #Requires inside a here-string or block comment is not a directive', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'guard-req-'));
+  const arrow = 'Write-Host "a → b"';
+  for (const [name, text] of [['here.ps1', `$doc = @'\n#Requires -Version 7\n'@\n${arrow}`],
+    ['block.ps1', `<#\n#Requires -Version 7\n#>\n${arrow}`]]) {
+    const p = path.join(dir, name);
+    fs.writeFileSync(p, text);
+    assert.strictEqual(checkPost(write(p, text), opts()).length, 1, name);
+  }
+});
+
+test('powershell: post rules stay edit-only, process exit codes match Bash', () => {
+  assert.deepStrictEqual(checkPost(ps('Write-Host "a \u2192 b"'), opts()), []);
+  const res = runHook({ hook_event_name: 'PreToolUse', ...ps('git add -A') });
+  assert.strictEqual(res.status, 2);
+  assert.match(res.stderr, /BLOCKED \(git-add-all\)/);
+  assert.strictEqual(runHook({ hook_event_name: 'PreToolUse', ...ps('Get-ChildItem') }).status, 0);
+});
+
+test('unicode-win-script: a .ps1 with a BOM or #Requires pwsh 6+ is exempt, .bat/.cmd are not', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'guard-ps1-'));
+  const file = (name, text) => {
+    const p = path.join(dir, name);
+    fs.writeFileSync(p, text);
+    return p;
+  };
+  const arrow = 'Write-Host "a \u2192 b"';
+  assert.match(checkPost(write(file('plain.ps1', arrow), arrow), opts())[0] || '', /BOM.*#Requires/);
+  for (const [name, text] of [['bom.ps1', `\uFEFF${arrow}`], ['req7.ps1', `#Requires -Version 7.2\n${arrow}`],
+    ['core.ps1', `#requires -PSEdition Core\n${arrow}`], ['req6.ps1', `# x\n#Requires -Version 6\n${arrow}`]]) {
+    assert.deepStrictEqual(checkPost(write(file(name, text), text), opts()), [], name);
+    const edit = { tool_name: 'Edit', tool_input: { file_path: path.join(dir, name), old_string: 'x', new_string: arrow } };
+    assert.deepStrictEqual(checkPost(edit, opts()), [], `${name} (Edit)`);
+  }
+  for (const [name, text] of [['req5.ps1', `#Requires -Version 5.1\n${arrow}`], ['bom.cmd', '\uFEFFecho \u2192'],
+    ['note.ps1', `# needs #Requires -Version 7 some day\n${arrow}`]]) {
+    assert.strictEqual(checkPost(write(file(name, text), text), opts()).length, 1, name);
+  }
+});

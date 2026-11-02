@@ -15,8 +15,11 @@
 // Scope: this is a seatbelt against agent mistakes, not a sandbox. It sees Edit/Write/
 // MultiEdit and the Bash command string, tokenized like a shell, where it finds what
 // redirects, tee, touch, truncate, sed -i, dd, rm, mv, cp, install and ln write or
-// remove, following literal cd. A script the agent writes and then runs, python -c,
-// $variables, eval, xargs and find -delete are not followed.
+// remove, following literal cd. The PowerShell tool's command is rewritten into the same
+// token stream (backslash paths, backtick escapes, here-strings) and its file cmdlets
+// and Set-Location/Push-Location are followed the same way. A script the agent writes and
+// then runs, python -c, $variables, eval/Invoke-Expression, .NET file calls, xargs and
+// find -delete are not followed.
 // Hard boundaries belong in permissions.deny and Claude Code's sandbox.
 const fs = require('fs');
 const os = require('os');
@@ -33,6 +36,7 @@ const SECRET_PATTERNS = [
   ['Bearer token', /Bearer\s+[a-zA-Z0-9_\-.]{30,}/],
 ];
 const EDIT_TOOLS = ['Edit', 'Write', 'MultiEdit'];
+const SHELLS = ['Bash', 'PowerShell'];
 const PY = /\.py$/i;
 const JS = /\.(m|c)?(j|t)sx?$/i;
 
@@ -183,7 +187,7 @@ function endSegment(lx, op = ';') {
     const first = plain(lx.words[0] || '');
     if (first === '{') lx.groups.push({ start: lx.segs.length, piped: lx.prevOp === '|', depth: lx.scopes.length });
     if (BODY_OPEN.has(first)) lx.bodies++;
-    lx.segs.push({ words: lx.words, redirs: lx.redirs, scope: [...lx.scopes],
+    lx.segs.push({ words: lx.words, redirs: lx.redirs, scope: [...lx.scopes], after: lx.prevOp,
       sub: op === '|' || op === '&' || lx.prevOp === '|',
       cond: lx.bodies > 0 || CONDITIONAL.has(lx.prevOp) || COND_WORDS.has(first) });
     if (BODY_CLOSE.has(first)) lx.bodies = Math.max(0, lx.bodies - 1);
@@ -468,9 +472,10 @@ function bracketEnd(pat, i) {
 }
 
 // Glob segment -> name test, bash style: * and ? skip dotfiles unless the pattern starts
-// with "."; an unclosed "[" is literal; a POSIX class ([[:lower:]]) matches any character
-// (over-matching blocks rather than misses). A pattern that fails to compile matches all.
-function globMatcher(pat) {
+// with "." (`dot`: PowerShell, which matches them too); an unclosed "[" is literal; a POSIX
+// class ([[:lower:]]) matches any character (over-matching blocks rather than misses).
+// A pattern that fails to compile matches all.
+function globMatcher(pat, dot = false) {
   let src = '';
   for (let i = 0; i < pat.length; i++) {
     const br = pat[i] === '[' ? bracketEnd(pat, i) : { end: -1 };
@@ -486,7 +491,7 @@ function globMatcher(pat) {
   } catch (e) {
     return () => true; // judged as matching everything: blocks rather than misses
   }
-  return (name) => re.test(name) && (pat.startsWith('.') || !name.startsWith('.'));
+  return (name) => re.test(name) && (dot || pat.startsWith('.') || !name.startsWith('.'));
 }
 
 // Expansion work per hook call; past it the call is stopped (see applyRules), not skipped.
@@ -550,18 +555,25 @@ function expandBraces(word, budget) {
 
 // Anchor at a dir; expand braces, then the first glob segment against the real directory
 // like bash (no match -> the literal word), recursing for globs further down the path.
+// A leaf path; an `ifMissing` op (a copy destination) is a whole tree when nothing is there
+// yet, because the copied directory then takes its name.
+function leaf(op, p) {
+  const path = plain(p);
+  return { path, tree: op.tree || (Boolean(op.ifMissing) && !fs.existsSync(path)) };
+}
+
 function anchorOp(op, cwd, budget) {
   const variants = expandBraces(op.path, budget);
-  if (variants.length > 1) return variants.flatMap((v) => anchorOp({ path: v, tree: op.tree }, cwd, budget));
+  if (variants.length > 1) return variants.flatMap((v) => anchorOp({ ...op, path: v }, cwd, budget));
   const m = op.path.match(GLOB_SEG);
-  if (!m) return [{ path: plain(at(cwd, home(op.path))), tree: op.tree }];
+  if (!m) return [leaf(op, at(cwd, home(op.path)))];
   const dir = at(cwd, home(m[1] || './'));
-  const names = listDir(plain(dir)).filter(globMatcher(m[2]));
+  const names = listDir(plain(dir)).filter(globMatcher(m[2], op.dot));
   spend(budget, names.length);
-  if (!names.length) return [{ path: plain(at(cwd, home(op.path))), tree: op.tree }];
+  if (!names.length) return [leaf(op, at(cwd, home(op.path)))];
   const rest = op.path.slice(m[0].length);
   const encode = (n) => n.replace(/[*?[{,}]/g, lit);
-  return names.flatMap((n) => anchorOp({ path: `${dir}/${encode(n)}${rest}`, tree: op.tree }, cwd, budget));
+  return names.flatMap((n) => anchorOp({ ...op, path: `${dir}/${encode(n)}${rest}` }, cwd, budget));
 }
 
 // One shell frame: the dirs it may be in (a set: a cd may be skipped or fail), the
@@ -603,8 +615,10 @@ function isDir(p) {
 }
 
 function changeDir(frame, name, args, cond) {
-  const arg = plain(splitArgs(args).operands[0] || '');
-  const next = dirTargets(frame, name, arg);
+  moveTo(frame, dirTargets(frame, name, plain(splitArgs(args).operands[0] || '')), cond);
+}
+
+function moveTo(frame, next, cond) {
   const unsure = cond || !next.every(isDir); // cd into a file or a missing dir fails
   const dirs = [...new Set(unsure ? [...frame.dirs, ...next] : next)];
   if (dirs.length > MAX_DIRS) throw new Error('too many possible working directories to check');
@@ -614,21 +628,262 @@ function changeDir(frame, name, args, cond) {
 
 // Every file a command line touches, relative paths anchored at each dir the shell may be
 // in at that point. A redirect on the cd itself opens before the cd runs.
-function shellOps(segs, startDir) {
+// `ps`: PowerShell keeps one location per session, so ( ), & { } and pipelines move it
+// too; every segment shares the top frame and a Set-Location that may not run is `cond`.
+// Its wildcards match dot-names as well.
+function shellOps(segs, startDir, ps = false) {
   const frames = new Map([[0, { dirs: [startDir], prev: [startDir], stack: [] }]]);
   const budget = { left: MAX_EXPANSIONS };
   const ops = [];
   for (const seg of segs) {
-    const frame = frameFor(frames, seg.scope);
+    const frame = ps ? frames.get(0) : frameFor(frames, seg.scope);
     const cmds = commandsOf(seg.words);
-    const local = cmds.flatMap((c) => fileOps(c.name, c.args)).concat(seg.redirs.map(writeOp))
-      .filter((o) => o.path && !/^(\/dev\/|nul$)/i.test(plain(o.path)));
+    const opsOf = (c) => (ps && PS_FILE_CMDS[c.name] ? psFileOps(c.name, c.args, seg.upstream)
+      : fileOps(c.name, c.args));
+    const local = cmds.flatMap(opsOf).concat(seg.redirs.map(writeOp))
+      .filter((o) => o.path && !/^(\/dev\/|nul$)/i.test(plain(o.path)))
+      .map((o) => (ps ? { ...o, dot: true } : o));
     const bases = frame.dirs.flatMap((d) => [d, ...wrapperDirs(seg.words).map((w) => at(d, home(w)))]);
     for (const base of bases) ops.push(...local.flatMap((o) => anchorOp(o, base, budget)));
     const { name, args } = cmds[0];
-    if (['cd', 'pushd', 'popd'].includes(name) && !seg.sub) changeDir(frame, name, args, seg.cond);
+    if (ps && PS_LOCATION[name]) psChangeDir(frame, PS_LOCATION[name], args, seg.cond, budget);
+    else if (!ps && ['cd', 'pushd', 'popd'].includes(name) && !seg.sub) changeDir(frame, name, args, seg.cond);
   }
   return ops;
+}
+
+// ------------------------- PowerShell commands -------------------------
+// The PowerShell tool's command is rewritten into the POSIX lexer's terms, then parsed by
+// parseShell: backslash is a path separator (-> /), backtick is the escape, '' and "" are
+// quote escapes, here-string bodies are data, <# #> is a comment, and { } stand alone as
+// words (PowerShell has no brace expansion). Raw text still goes to the secret check.
+
+const SMART_QUOTES = { '‘': "'", '’': "'", '‚': "'", '‛': "'",
+  '“': '"', '”': '"', '„': '"' };
+const PS_ESC = { 0: '', a: '\x07', b: '\b', e: '\x1b', f: '\f', n: '\n', r: '\r', t: '\t', v: '\v' };
+
+// A here-string body runs from the line after @' / @" to a line starting with '@ / "@.
+function skipHereString(cmd, i, q) {
+  const close = new RegExp(`\\n[ \\t]*${q}@`, 'g');
+  close.lastIndex = i;
+  const m = close.exec(cmd);
+  return m ? m.index + m[0].length - 1 : cmd.length;
+}
+
+function psToPosix(raw) {
+  const cmd = raw.replace(/[‘-„]/g, (c) => SMART_QUOTES[c] || c);
+  let out = '';
+  let q = null;
+  for (let i = 0; i < cmd.length; i++) {
+    const ch = cmd[i];
+    const next = cmd[i + 1];
+    if (q === "'") {
+      if (ch === "'" && next === "'") { out += "'\\''"; i++; }
+      else { if (ch === "'") q = null; out += ch === '\\' ? '/' : ch; }
+    } else if (q === '"') {
+      if (ch === '`' && next !== undefined) {
+        i++;
+        out += '"$`'.includes(next) ? `\\${next}` : PS_ESC[next] ?? next;
+      } else if (ch === '"' && next === '"') { out += '\\"'; i++; }
+      else { if (ch === '"') q = null; out += ch === '\\' ? '/' : ch; }
+    } else if (ch === '@' && (next === "'" || next === '"') && /^[ \t]*\r?\n/.test(cmd.slice(i + 2))) {
+      i = skipHereString(cmd, i + 2, next);
+      out += "''";
+    } else if (ch === '<' && next === '#') {
+      const end = cmd.indexOf('#>', i + 2);
+      i = end < 0 ? cmd.length : end + 1;
+      out += ' ';
+    } else if (ch === '`') {
+      const n = cmd[++i];
+      if (n === '\r' && cmd[i + 1] === '\n') i++;
+      if (n === '\n' || n === '\r') out += ' '; // line continuation: a separator, like the newline
+      else if (n !== undefined) out += `\\${n}`;
+    } else if (ch === "'" || ch === '"') { q = ch; out += ch; }
+    else if (ch === '$' && /^\$null(?![\w:])/i.test(cmd.slice(i, i + 6))) { out += '/dev/null'; i += 4; }
+    else if (ch === '\\') out += '/';
+    else if (ch === '{' || ch === '}') out += ` ${ch} `;
+    else out += ch;
+  }
+  return out;
+}
+
+// Each { } block boundary starts a new command: "try { Set-Content x } catch { }" is
+// "try", "Set-Content x", "catch". A command in any block may not run (if/else/loop
+// bodies, scriptblocks maybe never invoked), nor one after && / || or in a pipeline / job,
+// so a Set-Location there keeps the old location possible (`cond`). `upstream` = operands
+// of the commands piping into it (Get-ChildItem vendor | Remove-Item); a segment's
+// redirects go with its last command.
+function psFlow(segs) {
+  const out = [];
+  let depth = 0;
+  let upstream = [];
+  for (const seg of segs) {
+    const piped = seg.after === '|' ? upstream : [];
+    const cond = () => depth > 0 || CONDITIONAL.has(seg.after) || seg.sub;
+    const parts = [];
+    let cur = [];
+    for (const w of seg.words) {
+      if (w !== '{' && w !== '}') { cur.push(w); continue; }
+      if (cur.length) parts.push({ words: cur, cond: cond() });
+      cur = [];
+      depth = w === '{' ? depth + 1 : Math.max(0, depth - 1);
+    }
+    if (cur.length || seg.redirs.length) parts.push({ words: cur, cond: cond() });
+    parts.forEach((p, i) => out.push({ ...seg, ...p, redirs: i === parts.length - 1 ? seg.redirs : [], upstream: piped }));
+    upstream = piped.concat(psSources(seg.words.filter((w) => w !== '{' && w !== '}')));
+  }
+  return out;
+}
+
+// Paths a pipeline stage hands down. A listing cmdlet hands down what it lists: its own
+// paths, else the location; with -Filter/-Include only the matching names, with -Recurse
+// the whole tree. Anything else ('a','b' | ..., Where-Object ...) hands down its words.
+const PS_LISTERS = new Set(['get-childitem', 'gci', 'ls', 'dir', 'get-item', 'gi', 'resolve-path', 'rvpa']);
+
+function psSources(words) {
+  const c = commandsOf(words)[0];
+  if (!PS_LISTERS.has(c.name)) return psArgs(words.filter((w) => !plain(w).startsWith('-'))).flat();
+  const b = psBind(c.args);
+  const paths = b.path.concat(b.pos[0] || []).map(psGlob).concat(b.literal);
+  const filters = b.filter.concat(b.pos[1] || []).map(psGlob);
+  const dirs = paths.length ? paths : ['.'];
+  if (b.recurse || !filters.length) return dirs;
+  return dirs.flatMap((d) => filters.map((f) => `${d}/${f}`));
+}
+
+const parsePowerShell = (cmd) => psFlow(parseShell(psToPosix(cmd)));
+
+const PS_LOCATION = { 'set-location': 'cd', sl: 'cd', cd: 'cd', chdir: 'cd', 'push-location': 'pushd',
+  pushd: 'pushd', pushl: 'pushd', 'pop-location': 'popd', popd: 'popd', popl: 'popd' };
+
+// The target binds like any cmdlet path (-Path:x, -LiteralPath x, positional); a -Path
+// wildcard resolves against the real directory like anywhere else. Push-Location with no
+// path only saves the location (bash pushd would swap).
+function psChangeDir(frame, name, args, cond, budget) {
+  const b = psBind(args);
+  const to = b.path.concat(b.pos[0] || []).map(psGlob).concat(b.literal)[0];
+  if (name === 'pushd' && to === undefined) frame.stack.push(frame.dirs);
+  else if (name === 'popd' || to === undefined || !GLOB_SEG.test(to)) {
+    changeDir(frame, name, to === undefined ? [] : ['--', to], cond);
+  } else {
+    if (name === 'pushd') frame.stack.push(frame.dirs);
+    const next = frame.dirs.flatMap((d) => anchorOp({ path: to, tree: false, dot: true }, d, budget).map((o) => o.path));
+    moveTo(frame, next, cond);
+  }
+}
+
+// Cmdlets (and their default aliases) that write or remove files, by how they bind paths.
+const PS_KINDS = {
+  content: ['set-content', 'sc', 'add-content', 'ac', 'clear-content', 'clc', 'out-file', 'tee-object', 'tee',
+    'export-csv', 'epcsv', 'export-clixml', 'set-item', 'si', 'clear-item', 'cli'],
+  new: ['new-item', 'ni', 'mkdir', 'md'],
+  remove: ['remove-item', 'ri', 'rm', 'del', 'erase', 'rd', 'rmdir'],
+  copy: ['copy-item', 'cpi', 'copy', 'cp'],
+  move: ['move-item', 'mi', 'move', 'mv'],
+  rename: ['rename-item', 'rni', 'ren'],
+};
+const PS_FILE_CMDS = Object.fromEntries(Object.entries(PS_KINDS).flatMap(([k, names]) => names.map((n) => [n, k])));
+
+// Parameter roles. A written name binds to a role if it is a prefix (>= 2 chars) of one of
+// its names; anything unknown is taken as a switch, so its value is left as a positional
+// path candidate -- an unknown parameter over-matches instead of hiding a path. `other`
+// takes a value that is never a path and fills no positional slot (-Encoding utf8).
+const PS_PARAMS = [
+  ['literal', ['literalpath', 'pspath', 'lp']],
+  ['path', ['path', 'filepath', 'fullname']],
+  ['dest', ['destination']],
+  ['newname', ['newname']],
+  ['whatif', ['whatif', 'wi']],
+  ['name', ['name']],
+  ['filter', ['filter', 'include']],
+  ['recurse', ['recurse']],
+  ['value', ['value']],
+  ['other', ['encoding', 'itemtype', 'type', 'exclude', 'credential', 'stream', 'delimiter', 'width',
+    'inputobject', 'target', 'stackname', 'erroraction', 'ea', 'warningaction', 'wa',
+    'errorvariable', 'ev', 'warningvariable', 'wv', 'outvariable', 'ov', 'outbuffer', 'ob',
+    'informationaction', 'infa', 'informationvariable', 'iv', 'pipelinevariable', 'pv', 'usequotes',
+    'quotefields', 'header', 'depth']],
+];
+
+function psRole(param) {
+  const p = param.toLowerCase();
+  if (p === 'r') return 'recurse'; // gci -r
+  if (p.length < 2) return 'switch';
+  const hit = PS_PARAMS.find(([, names]) => names.some((n) => n.startsWith(p)));
+  return hit ? hit[0] : 'switch';
+}
+
+// FileSystem::C:\x and Microsoft.PowerShell.Core\FileSystem::C:\x are plain paths
+// (the backslash is already a / here).
+const PS_PROVIDER = /^(microsoft\.powershell\.core\/)?filesystem::/i;
+
+// "a.txt, b.txt" arrives as words "a.txt," "b.txt": glue unquoted commas back into one
+// argument, then split it into its items.
+function psArgs(words) {
+  const glued = [];
+  for (const w of words) {
+    if (glued.length && (glued[glued.length - 1].endsWith(',') || w.startsWith(','))) glued[glued.length - 1] += w;
+    else glued.push(w);
+  }
+  return glued.map((w) => w.split(',').filter(Boolean).map((x) => x.replace(PS_PROVIDER, '')));
+}
+
+// -> { path: [], literal: [], dest: [], ..., recurse: bool, pos: [[...], ...] }
+function psBind(words) {
+  const b = { path: [], literal: [], dest: [], newname: [], name: [], filter: [], value: [], other: [],
+    recurse: false, whatif: false, pos: [] };
+  const args = psArgs(words);
+  for (let i = 0; i < args.length; i++) {
+    const w = args[i].join(',');
+    const m = plain(w).match(/^-([A-Za-z][\w-]*)(:)?/);
+    if (!m) { b.pos.push(args[i]); continue; }
+    const role = psRole(m[1]);
+    if (role === 'switch') continue;
+    if (role === 'recurse') { b.recurse = true; continue; }
+    if (role === 'whatif') { b.whatif = !(m[2] && /^\$false$/i.test(w.slice(m[0].length))); continue; }
+    b[role].push(...(m[2] ? w.slice(m[0].length).split(',').filter(Boolean) : args[++i] || []));
+  }
+  return b;
+}
+
+// Wildcards in -Path apply even when quoted; -LiteralPath and destinations are literal.
+const psGlob = (w) => w.replace(/[-]/g, (c) => UNLIT[c]);
+
+// Positional slots per kind, in order; positionals fill the ones not given by name
+// (Copy-Item -Path a b: b is the Destination). Out-File / Export-Csv's second slot is not a
+// path either, so it counts as `value`.
+const PS_SLOTS = { content: ['path', 'value'], new: ['path'], remove: ['path'], copy: ['path', 'dest'],
+  move: ['path', 'dest'], rename: ['path', 'newname'] };
+
+// $_ / $PSItem (or $_.FullName) as a path = the object coming down the pipeline.
+const fromPipe = (w) => /^\$(_|psitem)(\.|$)/i.test(plain(w));
+
+// Files a PowerShell file cmdlet writes or removes. More positionals than free slots means
+// a parameter was misread, so every positional then counts as a target too.
+function psFileOps(name, args, upstream = []) {
+  const kind = PS_FILE_CMDS[name];
+  const b = psBind(args);
+  if (b.whatif) return []; // -WhatIf only reports what it would do
+  const free = PS_SLOTS[kind].filter((s) => (s === 'path' ? !b.path.length && !b.literal.length : !b[s].length));
+  b.pos.slice(0, free.length).forEach((items, i) => b[free[i]].push(...items));
+  const extra = b.pos.length > free.length ? b.pos.flat().map(psGlob) : [];
+  const targets = b.path.map(psGlob).concat(b.literal);
+  const own = targets.filter((t) => !fromPipe(t));
+  const given = own.length < targets.length || !own.length ? own.concat(upstream) : own;
+  if (kind === 'content') return given.concat(extra).map(writeOp);
+  if (kind === 'remove') return given.concat(extra).map(treeOp);
+  if (kind === 'new') {
+    if (!b.name.length) return given.concat(extra).map(writeOp);
+    return b.name.flatMap((n) => (own.length ? own : ['.']).map((d) => writeOp(`${d}/${n}`))).concat(extra.map(writeOp));
+  }
+  if (kind === 'rename') {
+    const to = b.newname[0];
+    return given.flatMap((s) => [treeOp(s), ...(to ? [writeOp(`${nodePath.posix.dirname(plain(s))}/${to}`)] : [])])
+      .concat(extra.map(treeOp));
+  }
+  const dests = b.dest.length ? b.dest : ['.'];
+  const into = dests.flatMap((d) => given.map((s) => treeOp(`${d}/${nodePath.posix.basename(plain(s))}`)));
+  return [...dests.map((d) => ({ ...writeOp(d), ifMissing: true })), ...into, ...(kind === 'move' ? given.map(treeOp) : []), ...extra.map(writeOp)];
 }
 
 // `git [-C dir] [-c k=v] <sub> <args>` -> { sub, args, config } for each reading of the
@@ -675,24 +930,24 @@ const isEnvFile = (p, root) => landings(p, root).every((s) => ENV_NAME.test(s[s.
 // Each rule: id (used in messages and in "disable"), when it applies, check -> message | null.
 
 const BLOCK_RULES = [
-  { id: 'git-add-all', tool: 'Bash',
+  { id: 'git-add-all', tool: SHELLS,
     check: (c) => c.segs.some(addsEverything)
       && 'git add -A/--all/./* stages everything (.env, dumps, keys). '
         + 'Add files by name, or run git add -n ... first and review.' },
-  { id: 'gpg-commit', tool: 'Bash',
+  { id: 'gpg-commit', tool: SHELLS,
     check: (c) => c.segs.some(commitsSigned) && c.gpgsign() === 'true'
       && 'commit.gpgsign=true: the pinentry prompt hangs a non-interactive agent shell. '
         + 'Use git -c commit.gpgsign=false commit ..., or ask the user to commit.' },
-  { id: 'guard-config', tool: ['edit', 'Bash'],
+  { id: 'guard-config', tool: ['edit', ...SHELLS],
     check: (c) => c.ops.some((o) => GUARD_FILES.some((g) => hits(o, g, c.root)))
       && 'guardrail config and hook settings are edited by the user, not the agent. '
         + 'Say what should change and why.' },
-  { id: 'readonly-dir', tool: ['edit', 'Bash'],
+  { id: 'readonly-dir', tool: ['edit', ...SHELLS],
     check: (c) => {
       const hit = c.readonly.find((d) => c.ops.some((o) => hits(o, d, c.root)));
       return hit && `${hit} is read-only (config "readonly"). Copy the pattern elsewhere.`;
     } },
-  { id: 'secret', tool: ['edit', 'Bash'],
+  { id: 'secret', tool: ['edit', ...SHELLS],
     check: (c) => {
       if (c.ops.every((o) => isEnvFile(o.path, c.root))) return null; // no op = nothing written
       const hits = SECRET_PATTERNS.filter(([, re]) => re.test(c.text)).map(([n]) => n);
@@ -726,9 +981,27 @@ const WARN_RULES = [
       && !/parse_mode\s*=\s*(ParseMode\.HTML|['"]HTML['"])/.test(c.text)
       && 'Telegram send with HTML entities but no parse_mode=HTML: users see raw &lt;.' },
   { id: 'unicode-win-script', tool: 'edit', file: /\.(bat|cmd|ps1)$/i,
-    check: (c) => /[←-↙—–]/.test(c.text)
-      && 'Unicode arrow/dash in a Windows script: use ASCII -> / --.' },
+    check: (c) => /[←-↙—–]/.test(c.text) && !readAsUtf8(c.ops[0].path)
+      && 'Unicode arrow/dash in a Windows script: use ASCII -> / --. In a .ps1 the alternatives '
+        + 'are a UTF-8 BOM, or #Requires -Version 7 when it never runs on Windows PowerShell 5.1.' },
 ];
+
+// A .ps1 that PowerShell 5.1 reads as UTF-8 (BOM at byte 0) or that only runs on
+// PowerShell 6+, judged from the whole file as written; unreadable or huge = no. A
+// #Requires line inside a here-string or a <# #> comment is text, not a directive.
+const REQUIRES_CORE = /^#requires\s[^\n]*-(version\s+([6-9]|\d{2,})|psedition\s+core)\b/im;
+const PS_INERT = /@(['"])[ \t]*\r?\n[\s\S]*?\r?\n[ \t]*\1@|<#[\s\S]*?#>/g;
+
+function readAsUtf8(file) {
+  if (!/\.ps1$/i.test(file)) return false;
+  try {
+    if (fs.statSync(file).size > 1 << 20) return false;
+    const text = fs.readFileSync(file, 'utf8');
+    return text.charCodeAt(0) === 0xFEFF || REQUIRES_CORE.test(text.replace(PS_INERT, ''));
+  } catch (e) {
+    return false;
+  }
+}
 
 // ------------------------------- engine -------------------------------
 
@@ -740,8 +1013,9 @@ function buildContext(input, env, gpgsign, config) {
   const isEdit = EDIT_TOOLS.includes(input.tool_name);
   const cmd = ti.command || '';
   const path = ti.file_path || '';
-  const segs = input.tool_name === 'Bash' ? parseShell(cmd) : [];
-  const ops = isEdit ? [writeOp(at(root, path))] : shellOps(segs, input.cwd || root);
+  const ps = input.tool_name === 'PowerShell';
+  const segs = input.tool_name === 'Bash' ? parseShell(cmd) : ps ? parsePowerShell(cmd) : [];
+  const ops = isEdit ? [writeOp(at(root, path))] : shellOps(segs, input.cwd || root, ps);
   return { tool: isEdit ? 'edit' : input.tool_name, cmd, path, segs, ops,
     text: isEdit ? newText(ti) : cmd, root, readonly, gpgsign };
 }

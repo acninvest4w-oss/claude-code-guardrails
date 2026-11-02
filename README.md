@@ -110,19 +110,23 @@ So `guard.js` splits by event:
 |---|---|---|---|
 | `git-add-all` | block | `git add -A` / `--all` / `.` / `*` / `:/` without `-n`/`--dry-run`, checked per chained command (`;` `&&` `\|\|` `\|` `&`), with `git -C`/`-c` prefixes | stages `.env`, keys and data dumps along with the change |
 | `gpg-commit` | block | `git commit` while `commit.gpgsign=true` | the signing prompt hung the agent terminal |
-| `guard-config` | block | edits to `.claude/guardrails.json`, `.claude/settings*.json` or `guard.js` itself, by Edit/Write or a shell write | the agent must not switch its own guard off |
+| `guard-config` | block | edits to `.claude/guardrails.json`, `.claude/settings*.json` or `guard.js` itself, by Edit/Write or a shell write (Bash or PowerShell) | the agent must not switch its own guard off |
 | `readonly-dir` | block | edits under a `readonly` dir, by Edit/Write or a shell write; `..` and symlinks/junctions resolved both ways (see below) | cloned reference repos are for reading; patterns get copied out, not patched in place |
 | `secret` | block | hardcoded keys/tokens (OpenAI, Anthropic, Gemini, GitHub, Slack, Telegram, Bearer) in an edit or a shell command that writes a file; `.env` / `.env.*` exempt | a key pasted into code ends up in git history; blocked before it touches disk |
 | `logger-non-ascii` | block | non-ASCII in Python `logger.*()` | emoji in a log line crashed async tasks on a cp1252 Windows VPS, 5+ times |
 | `broad-except-py` | warn | `except Exception` in Python | a blanket catch hides the error you need when something breaks |
 | `empty-catch-js` | warn | empty `catch {}` in JS/TS | same failure in JS: the error just disappears |
 | `telegram-parse-mode` | warn | Telegram send with `&lt;` entities but no `parse_mode=HTML` | users of a scanner bot saw raw `&lt;b&gt;`, more than once |
-| `unicode-win-script` | warn | Unicode arrows/dashes in `.ps1/.bat/.cmd` | Windows PowerShell 5.1 reads BOM-less UTF-8 as ANSI and mangles them |
+| `unicode-win-script` | warn | Unicode arrows/dashes in `.ps1/.bat/.cmd`; a `.ps1` whose file starts with a UTF-8 BOM or carries `#Requires -Version 6+` / `-PSEdition Core` is exempt | Windows PowerShell 5.1 reads BOM-less UTF-8 as ANSI and mangles them |
 
 Every message starts with its rule id, so turning one off is a one-line config change.
+The five block rules that look at commands apply to both the **Bash** and the
+**PowerShell** tool (Claude Code on Windows), see below.
 
 Install: copy `hooks/guard.js` to `.claude/hooks/` and merge
-[`examples/settings.json`](examples/settings.json) into `.claude/settings.json`.
+[`examples/settings.json`](examples/settings.json) into `.claude/settings.json`. The
+PreToolUse matcher must list `PowerShell` too: a hook that matches only `Bash` never sees
+the PowerShell tool, whatever the rules say.
 
 Configure per project in `.claude/guardrails.json` (optional, no code edits):
 
@@ -169,9 +173,35 @@ A seatbelt against agent mistakes, not a sandbox against an adversary.
   the real directory like bash does (`rm *.log` is fine, `rm -rf *` at the root is not,
   a quoted `'*'` is a literal name), braces `{a,b}` and `{1..3}` too; past 2000 expanded
   names the call is stopped rather than checked partially. It does not follow a script the agent writes and then
-  runs, `python -c`, `$variables` (`cd $DIR`), `eval`, `bash <<EOF`, `xargs`, `find -delete`,
-  or the PowerShell tool. For hard file boundaries use `permissions.deny` (e.g. `Edit(./vendor/**)`)
+  runs, `python -c`, `$variables` (`cd $DIR`), `eval`, `bash <<EOF`, `xargs` or `find -delete`.
+  For hard file boundaries use `permissions.deny` (e.g. `Edit(./vendor/**)`)
   and Claude Code's sandbox; this hook adds the *explanation* the model needs to stop retrying.
+- The **PowerShell** tool's command is rewritten into the same tokens before parsing:
+  `\` is a path separator, the backtick is the escape and the line continuation, `''`/`""`
+  escape quotes, here-string bodies and `<# #>` comments are data, smart quotes are quotes.
+  It finds what `Set-Content`/`Add-Content`/`Clear-Content`/`Out-File`/`Tee-Object`/
+  `Export-Csv`/`Set-Item`, `New-Item` (with `-Name`), `Remove-Item`, `Copy-Item` (destination
+  only: copying *out* of a read-only dir is fine), `Move-Item` and `Rename-Item` write or
+  remove, under their default aliases (`sc`, `ni`, `ri`, `del`, `cpi`, `mi`, `ren`, ...), plus
+  redirects. Parameters bind like PowerShell does: any case, unique prefixes (`-Dest`),
+  `-Path:x`, comma lists, positionals filling the slots not given by name
+  (`Copy-Item -Path a .claude\settings.json` writes the second one); `-Path` globs even when
+  quoted and matches dot-names, `-LiteralPath` never; `FileSystem::` prefixes are
+  stripped; a copy into a destination that does not exist yet counts as creating that whole
+  tree; `-WhatIf` previews are let through. An unknown parameter is taken as a
+  switch, so its value is checked as a path too. Commands inside `{ }` blocks (`try`, `if`,
+  `ForEach-Object`, `. { }`) are checked like any other, and a cmdlet fed by a pipeline
+  with no path, or with `$_`, is judged by the paths upstream
+  (`Get-ChildItem vendor | ForEach-Object { Remove-Item $_ }`): a listing cmdlet hands
+  down what it lists (its paths or the current location, narrowed by `-Filter`/`-Include`
+  unless `-Recurse`). The guard does not walk a tree, so `Get-ChildItem -Recurse -Include
+  *.tmp | Remove-Item` at the project root is stopped (it reaches `.claude`); give it the
+  subdirectory (`Get-ChildItem build -Recurse ...`). The location is per session in PowerShell, so
+  `Set-Location`/`Push-Location`/`Pop-Location` move it even inside `( )`, `$( )`,
+  `& { }` and pipelines; inside any `{ }` block, after `&&`/`||` or in a pipeline the old
+  location stays possible too. Not followed: `$variables` and splatting, `Invoke-Expression`,
+  `.NET` calls (`[IO.File]::WriteAllText`), `Start-Process`, jobs and remoting, and aliases
+  or functions defined outside the command.
 - Paths are judged both ways an OS may resolve them: `..` first, then links (Windows,
   `path.resolve`), and links first, then `..` (a POSIX kernel: with `alias -> vendor/sub`,
   `alias/../x` is `vendor/x`). If either lands in a protected place, the call is blocked.
@@ -188,8 +218,12 @@ Bypass attempts are tested in [`hooks/tests/guard.test.js`](hooks/tests/guard.te
 `rm -rf .claude`, `cp x .claude/`, quoted paths with spaces, `cd /tmp > file`,
 `(cd /tmp); ...`, `pushd`/`popd`, `$'...'`, a glob through a symlink), `git add -A
 --dry-run; git add -A`, `"git" add -A`, `command -- git add -A`, `git add -- . -n`, a
-`.env` symlink into source, edits to the guard's own config. A sweep of everyday commands
-(`rm -f *.log`, `cp .env.example .env`, heredocs, `2>&1`) checks that none are blocked.
+`.env` symlink into source, edits to the guard's own config. The PowerShell side gets the
+same treatment (`& 'C:\...\git.exe' add -A`, `Set-Content E:\repo\.claude\settings.json`,
+`(Set-Location vendor); ...`, `& { cd vendor }; ...`, quoted globs, alias spellings,
+module-qualified cmdlets). A sweep of everyday commands (`rm -f *.log`,
+`cp .env.example .env`, heredocs, `2>&1`, `Copy-Item vendor\a src\`, here-strings,
+`2>$null`) checks that none are blocked.
 
 **Windows:** each hook spawns `node` in a new console, so a window flashes on every
 tool call. [`hooks/hide.py`](hooks/hide.py) runs it under `pythonw` with
