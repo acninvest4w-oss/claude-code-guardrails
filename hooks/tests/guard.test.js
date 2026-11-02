@@ -643,6 +643,50 @@ test('powershell: provider-qualified paths, copies into a missing dir, -WhatIf p
   assert.deepStrictEqual(ids('Remove-Item vendor -Recurse -WhatIf:$false'), ['readonly-dir']);
 });
 
+// Git Bash / Cygwin spell C:\repo as /c/repo or /cygdrive/c/repo.
+test('red team: Git Bash drive paths reach the same checks on a Windows project', () => {
+  const win = (extra = {}) => opts({ env: { CLAUDE_PROJECT_DIR: 'C:\\repo' }, ...extra });
+  const run = (command, cfg = win()) => idsOf(checkPre({ tool_name: 'Bash', tool_input: { command }, cwd: 'C:\\repo' }, cfg));
+  for (const cmd of ['echo x > /c/repo/.claude/settings.json', 'echo x > /C/repo/.claude/settings.json',
+    'echo x > /cygdrive/c/repo/.claude/guardrails.json', 'cd /c/repo/.claude && echo x > settings.json',
+    'rm -rf /c/repo/.claude', 'cp /tmp/settings.json /c/repo/.claude/',
+    'echo x > /cygdrive//c/repo/.claude/settings.json', 'echo x > //c/repo/.claude/settings.json',
+    'echo x > /cygdrive/[c]/repo/.claude/settings.json', 'echo x > /[bc]/repo/.claude/settings.json',
+    'echo x > /?/repo/.claude/settings.json', 'cd /c && echo x > repo/.claude/settings.json']) {
+    assert.deepStrictEqual(run(cmd), ['guard-config'], cmd);
+  }
+  const ro = win({ config: { readonly: ['vendor/', '/c/tools/guard/'] } });
+  assert.deepStrictEqual(run('echo x > /c/repo/vendor/a.py', ro), ['readonly-dir']);
+  assert.deepStrictEqual(run('touch C:/tools/guard/hide.py', ro), ['readonly-dir']);
+  assert.deepStrictEqual(idsOf(checkPre(write('C:\\tools\\guard\\hide.py', 'x'), ro)), ['readonly-dir']);
+  assert.deepStrictEqual(idsOf(checkPre(write('/c/repo/.claude/settings.json', '{}'), win())), ['guard-config']);
+  for (const cmd of ['echo x > /tmp/out.txt', 'ls /dev/null > /d/data/out.txt', 'echo x > /c/repo/src/a.py',
+    'cat /c/repo/.claude/settings.json > /tmp/s.json']) {
+    assert.deepStrictEqual(run(cmd, ro), [], cmd);
+  }
+  // on a POSIX project /c/... is just a directory called c
+  assert.deepStrictEqual(checkPre(bash('echo x > /c/repo/.claude/settings.json'), opts()), []);
+  // in PowerShell /c/repo is \c\repo on the current drive, not C:\repo
+  assert.deepStrictEqual(checkPre(ps('Set-Content /c/repo/.claude/settings.json x', 'C:\\repo'), win()), []);
+  // ... but a config entry is the user's and means the drive for every tool
+  assert.deepStrictEqual(idsOf(checkPre(ps('Set-Content C:\\tools\\guard\\hide.py x', 'C:\\repo'), ro)), ['readonly-dir']);
+});
+
+test('red team: Git Bash drive paths glob and cd against the real directory (Windows)', (t) => {
+  if (process.platform !== 'win32') {
+    t.skip('needs a drive-letter filesystem');
+    return;
+  }
+  const { root, run } = realProject(t);
+  const msys = root.replace(/^([A-Za-z]):[\\/]/, '/$1/').replace(/\\/g, '/');
+  const ids = (cmd) => run(cmd).map((m) => m.match(/^\((.+?)\)/)[1]);
+  assert.ok(ids(`rm -f ${msys}/.claude/*`).includes('guard-config'));
+  assert.ok(ids(`rm -f /cygdrive${msys}/.claude/*`).includes('guard-config'));
+  // a cd into a real dir is certain, so the old dir is not kept as a possibility
+  assert.deepStrictEqual(run(`cd ${msys}/src && rm -rf *`), []);
+  assert.deepStrictEqual(run(`cd ${msys}/src && echo x > settings.json`), []);
+});
+
 test('unicode-win-script: #Requires inside a here-string or block comment is not a directive', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'guard-req-'));
   const arrow = 'Write-Host "a → b"';

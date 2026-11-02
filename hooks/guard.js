@@ -106,7 +106,20 @@ function toSegments(p) {
   return /^[a-zA-Z]:$/.test(segs[0] || '') ? segs.map((s) => s.toLowerCase()) : segs;
 }
 
-const joinRoot = (p, root) => (isAbs(p) ? p : `${root || ''}/${p}`);
+// Git Bash, MSYS and Cygwin spell C:\x as /c/x or /cygdrive/c/x. On a project with a drive
+// root those name the same files, so Bash words are mapped before any path is judged
+// (`driveMounts`, set per call in buildContext). PowerShell reads /c/x as \c\x on the
+// current drive, so its words are left alone.
+// Repeated slashes count as one (/cygdrive//c), and a bare /c is the drive's root.
+const DRIVE_MOUNT = /^\/+(?:cygdrive\/+)?([a-zA-Z])(?=\/|$)/;
+const unmount = (p) => p.replace(DRIVE_MOUNT, '$1:').replace(/^([a-zA-Z]:)$/, '$1/');
+let driveMounts = false;
+const mounted = (p) => (driveMounts ? unmount(p) : p);
+
+function joinRoot(p, root) {
+  const q = mounted(p);
+  return isAbs(q) ? q : `${root || ''}/${q}`;
+}
 
 // Lexical: ".." collapsed first, then links resolved (Windows, path.resolve).
 function lexicalSegments(p, root) {
@@ -454,7 +467,7 @@ function fileOps(name, args) {
 }
 
 const at = (dir, p) => (isAbs(p) || !dir ? p : `${dir}/${p}`);
-const home = (p) => p.replace(/^~(?=$|[\\/])/, os.homedir());
+const home = (p) => mounted(p.replace(/^~(?=$|[\\/])/, os.homedir()));
 
 // End of a bracket expression starting at pat[i] === '[', or -1 if it never closes.
 // POSIX classes like [:lower:] are skipped whole; `posix` reports that one was seen.
@@ -562,9 +575,21 @@ function leaf(op, p) {
   return { path, tree: op.tree || (Boolean(op.ifMissing) && !fs.existsSync(path)) };
 }
 
+// /[c]/x or /cygdrive/?/x: a glob in the drive slot matches drive letters, which no
+// native directory listing shows.
+const DRIVE_GLOB = /^\/+(?:cygdrive\/+)?([^/]*[*?[][^/]*)(?=\/|$)/;
+const LETTERS = 'abcdefghijklmnopqrstuvwxyz'.split('');
+
 function anchorOp(op, cwd, budget) {
   const variants = expandBraces(op.path, budget);
   if (variants.length > 1) return variants.flatMap((v) => anchorOp({ ...op, path: v }, cwd, budget));
+  const drives = driveMounts && op.path.match(DRIVE_GLOB);
+  if (drives) {
+    const hits = LETTERS.filter(globMatcher(drives[1]));
+    spend(budget, hits.length);
+    const rest = op.path.slice(drives[0].length);
+    if (hits.length) return hits.flatMap((l) => anchorOp({ ...op, path: `${l}:${rest || '/'}` }, cwd, budget));
+  }
   const m = op.path.match(GLOB_SEG);
   if (!m) return [leaf(op, at(cwd, home(op.path)))];
   const dir = at(cwd, home(m[1] || './'));
@@ -1008,12 +1033,16 @@ function readAsUtf8(file) {
 function buildContext(input, env, gpgsign, config) {
   const ti = input.tool_input || {};
   const root = env.CLAUDE_PROJECT_DIR || input.cwd || '';
+  const ps = input.tool_name === 'PowerShell';
+  const driveRoot = /^[a-zA-Z]:/.test(root);
+  driveMounts = driveRoot && !ps;
+  // a config entry is the user's: /c/tools means C:\tools on a Windows project, any tool
   const fromEnv = (env.GUARDRAILS_READONLY || '').split(',');
-  const readonly = fromEnv.concat(config.readonly || []).map((s) => s.trim()).filter(Boolean);
+  const readonly = fromEnv.concat(config.readonly || []).map((s) => s.trim()).filter(Boolean)
+    .map((s) => (driveRoot ? unmount(s) : s));
   const isEdit = EDIT_TOOLS.includes(input.tool_name);
   const cmd = ti.command || '';
   const path = ti.file_path || '';
-  const ps = input.tool_name === 'PowerShell';
   const segs = input.tool_name === 'Bash' ? parseShell(cmd) : ps ? parsePowerShell(cmd) : [];
   const ops = isEdit ? [writeOp(at(root, path))] : shellOps(segs, input.cwd || root, ps);
   return { tool: isEdit ? 'edit' : input.tool_name, cmd, path, segs, ops,
@@ -1037,15 +1066,20 @@ function applyRules(rules, input, opts = {}) {
   try {
     c = buildContext(input, env, opts.gpgsign || readGpgsign, config);
   } catch (e) {
+    driveMounts = false;
     return [`(parse-error) could not read this call (${e.message}); stopped to be safe.`];
   }
   const off = new Set(config.disable || []);
-  return rules
-    .filter((r) => !off.has(r.id) && [].concat(r.tool).includes(c.tool)
-      && (!r.file || r.file.test(c.path)))
-    .map((r) => [r.id, runCheck(r, c)])
-    .filter(([, msg]) => msg)
-    .map(([id, msg]) => `(${id}) ${msg}`);
+  try {
+    return rules
+      .filter((r) => !off.has(r.id) && [].concat(r.tool).includes(c.tool)
+        && (!r.file || r.file.test(c.path)))
+      .map((r) => [r.id, runCheck(r, c)])
+      .filter(([, msg]) => msg)
+      .map(([id, msg]) => `(${id}) ${msg}`);
+  } finally {
+    driveMounts = false; // one call's reading, not the next one's
+  }
 }
 
 const checkPre = (input, opts) => applyRules(BLOCK_RULES, input, opts);

@@ -220,6 +220,9 @@ A seatbelt against agent mistakes, not a sandbox against an adversary.
 - Paths are judged both ways an OS may resolve them: `..` first, then links (Windows,
   `path.resolve`), and links first, then `..` (a POSIX kernel: with `alias -> vendor/sub`,
   `alias/../x` is `vendor/x`). If either lands in a protected place, the call is blocked.
+  On a project with a drive root, Git Bash/MSYS/Cygwin spellings (`/c/repo/x`,
+  `/cygdrive/c/repo/x`) in Bash commands and in `readonly` entries are the same `C:\repo\x`;
+  in PowerShell `/c/x` stays `\c\x` on the current drive, as PowerShell reads it.
 - A Bash command that carries a token *and* writes a file is blocked, e.g.
   `curl -H "Authorization: Bearer ..." > out.json`. Put the token in an env var.
 - `GUARDRAILS_OFF` / `GUARDRAILS_READONLY` come from the environment Claude Code was
