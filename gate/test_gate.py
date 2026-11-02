@@ -16,6 +16,11 @@ Exit codes: 0 pass | 1 still red after all rounds (call a human)
               pytest 4 = path not found, 5 = no tests) or --protect matched no file
             8 test command timed out (--test-timeout), process tree killed
             9 --max-cost budget reached before the tests went green
+
+Common test-config files (conftest.py, pytest.ini, pyproject.toml, package.json,
+jest/vitest config ...) at the project root are protected too, even before they
+exist, so a new root conftest.py with collect_ignore is caught. --no-auto-protect
+turns that off, e.g. when the fix legitimately needs a new dependency.
 """
 from __future__ import annotations
 
@@ -43,6 +48,12 @@ EXIT_TIMEOUT = 8
 EXIT_BUDGET = 9
 
 FIXER_TOOLS = "Read,Edit,Write,Grep,Glob"
+AUTO_PROTECT = (
+    "conftest.py", "pytest.ini", "pyproject.toml", "setup.cfg", "tox.ini", ".coveragerc",
+    "package.json", "jest.config.js", "jest.config.ts", "jest.config.mjs", "jest.config.cjs",
+    "vitest.config.js", "vitest.config.ts", "vitest.config.mjs", "vitest.config.mts",
+)
+BUDGET_SUBTYPE = "error_max_budget_usd"
 IGNORED_PARTS = {"__pycache__", ".pytest_cache", "bin", "obj", "node_modules"}
 FAIL_MARKERS = re.compile(r"FAILED|ERROR|Error:|AssertionError|assert |Traceback")
 EARLY_FAIL_LINES = 20
@@ -67,6 +78,7 @@ class FixerResult:
     failed: bool
     text: str
     cost: float
+    budget_hit: bool = False  # claude stopped itself at --max-budget-usd
 
 
 def kill_tree(proc: subprocess.Popen) -> None:
@@ -202,9 +214,11 @@ def parse_fixer(stdout: str, stderr: str) -> FixerResult:
         data = json.loads(lines[-1])
     except (json.JSONDecodeError, IndexError):
         return FixerResult(True, stdout + stderr, 0.0)
-    failed = bool(data.get("is_error")) and data.get("subtype") != "error_max_turns"
-    text = f"[{data.get('subtype')}] {data.get('result', '')}\n{stderr}"
-    return FixerResult(failed, text, float(data.get("total_cost_usd") or 0.0))
+    subtype = data.get("subtype")
+    budget_hit = subtype == BUDGET_SUBTYPE
+    failed = bool(data.get("is_error")) and subtype != "error_max_turns" and not budget_hit
+    text = f"[{subtype}] {data.get('result', '')} {data.get('errors', '')}\n{stderr}"
+    return FixerResult(failed, text, float(data.get("total_cost_usd") or 0.0), budget_hit)
 
 
 def call_fixer(prompt: str, cfg: argparse.Namespace) -> FixerResult:
@@ -215,6 +229,8 @@ def call_fixer(prompt: str, cfg: argparse.Namespace) -> FixerResult:
            "--disallowedTools", deny_rules(cfg.protect), "--max-turns", str(cfg.max_turns)]
     if cfg.model:
         cmd += ["--model", cfg.model]
+    if cfg.max_cost > 0:  # the CLI stops itself mid-round; overshoot <= one API call
+        cmd += ["--max-budget-usd", f"{max(cfg.max_cost - cfg.cost, 0.01):.2f}"]
     res = run_proc(cmd, cfg.cwd, cfg.fixer_timeout, stdin_data=prompt.encode("utf-8"))
     if res.code is None:
         return FixerResult(True, f"fixer timed out after {cfg.fixer_timeout:g}s, killed", 0.0)
@@ -259,9 +275,9 @@ def judge_run(cfg: argparse.Namespace, run: TestRun, log_name: str, rnd: int) ->
     return None
 
 
-def over_budget(cfg: argparse.Namespace) -> bool:
-    """Checked between rounds, so one round may overshoot the cap."""
-    return cfg.max_cost > 0 and cfg.cost >= cfg.max_cost
+def over_budget(cfg: argparse.Namespace, res: FixerResult) -> bool:
+    """The CLI enforces the remaining budget inside a round; this catches the rest."""
+    return res.budget_hit or (cfg.max_cost > 0 and cfg.cost >= cfg.max_cost)
 
 
 def fix_round(cfg: argparse.Namespace, run: TestRun, rnd: int,
@@ -279,7 +295,7 @@ def fix_round(cfg: argparse.Namespace, run: TestRun, rnd: int,
         print(f"[gate] ABORT: fixer call failed (auth/API error or timeout), "
               f"see fixer_{rnd}.txt in {cfg.log_dir}")
         return EXIT_FIXER_FAILED
-    if over_budget(cfg):
+    if over_budget(cfg, res):
         print(f"[gate] STOP: spent ${cfg.cost:.2f} >= --max-cost ${cfg.max_cost:.2f}. "
               f"Logs: {cfg.log_dir}")
         return EXIT_BUDGET
@@ -346,12 +362,17 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
                     help="seconds per test run before the process tree is killed")
     ap.add_argument("--fixer-timeout", type=float, default=1800,
                     help="seconds per fixer call before it is killed")
-    ap.add_argument("--max-cost", type=float, default=0.0,
-                    help="stop once fixer spend reaches this many USD (0 = no cap)")
+    ap.add_argument("--max-cost", type=float, default=5.0,
+                    help="USD cap on fixer spend, enforced inside each call (0 = no cap)")
+    ap.add_argument("--no-auto-protect", action="store_true",
+                    help="do not protect root test-config files (pyproject.toml, conftest.py ...)")
     ap.add_argument("--cwd", default=".")
     cfg = ap.parse_args(argv)
     cfg.cwd = Path(cfg.cwd).resolve()
     cfg.red_codes = {int(c) for c in cfg.red_codes.split(",")}
+    cfg.explicit_protect = list(cfg.protect)
+    if not cfg.no_auto_protect:
+        cfg.protect += [n for n in AUTO_PROTECT if n not in cfg.protect]
     cfg.claude = shutil.which("claude")
     cfg.log_dir = Path(tempfile.mkdtemp(prefix="test_gate_"))
     (cfg.log_dir / "protected").mkdir()
@@ -366,8 +387,8 @@ def main(argv: list[str] | None = None) -> int:
     if not cfg.claude:
         print("[gate] claude CLI not found on PATH")
         return EXIT_NO_CLAUDE
-    if not iter_protected(cfg.protect, cfg.cwd):
-        print(f"[gate] ABORT: --protect {cfg.protect} matched no file under {cfg.cwd}; "
+    if not iter_protected(cfg.explicit_protect, cfg.cwd):
+        print(f"[gate] ABORT: --protect {cfg.explicit_protect} matched no file under {cfg.cwd}; "
               "the tests would be unprotected. Wrong cwd?")
         return EXIT_BAD_SETUP
     return gate_loop(cfg)

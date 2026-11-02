@@ -192,3 +192,52 @@ def test_check_mode_reports_timeout(project):
     cfg = make_cfg(project, test=f'"{sys.executable}" -c "import time; time.sleep(60)"',
                    test_timeout=1)
     assert gate.run_check(cfg) == gate.EXIT_TIMEOUT
+
+
+def test_new_root_conftest_is_caught_without_listing_it(project, monkeypatch):
+    def hide_tests(cwd, prompt):
+        (cwd / "conftest.py").write_text('collect_ignore = ["tests"]\n')
+    monkeypatch.setattr(gate, "call_fixer", fake_fixer(hide_tests))
+    assert gate.gate_loop(make_cfg(project)) == gate.EXIT_TAMPERED
+    assert not (project / "conftest.py").exists()
+
+
+def test_root_test_config_is_protected_unless_opted_out(project, monkeypatch):
+    (project / "pyproject.toml").write_text("[tool.pytest.ini_options]\n")
+    def fix_and_skip(cwd, prompt):
+        (cwd / "calc.py").write_text(FIXED)
+        (cwd / "pyproject.toml").write_text('[tool.pytest.ini_options]\naddopts = "-k nothing"\n')
+    monkeypatch.setattr(gate, "call_fixer", fake_fixer(fix_and_skip))
+    assert gate.gate_loop(make_cfg(project)) == gate.EXIT_TAMPERED
+    assert (project / "pyproject.toml").read_text() == "[tool.pytest.ini_options]\n"
+    cfg = gate.parse_args(["--test", "x", "--cwd", str(project), "--no-auto-protect"])
+    assert cfg.protect == ["tests"]
+
+
+def test_parse_fixer_budget_stop_is_not_an_api_failure():
+    raw = ('{"subtype":"error_max_budget_usd","is_error":true,"total_cost_usd":0.4,'
+           '"errors":["Reached maximum budget ($0.30)"]}')
+    res = gate.parse_fixer(raw, "")
+    assert not res.failed and res.budget_hit and res.cost == 0.4
+
+
+def test_fixer_gets_the_remaining_budget(project, monkeypatch):
+    seen = []
+    def fake_run(cmd, cwd, timeout, **kw):
+        seen.append(cmd)
+        return gate.ProcResult(0, b'{"subtype":"success","total_cost_usd":0}', b"")
+    monkeypatch.setattr(gate, "run_proc", fake_run)
+    gate.call_fixer("p", make_cfg(project, max_cost=2.0, cost=1.25))
+    gate.call_fixer("p", make_cfg(project, max_cost=0))
+    assert seen[0][seen[0].index("--max-budget-usd") + 1] == "0.75"
+    assert "--max-budget-usd" not in seen[1]
+
+
+def test_budget_hit_inside_a_round_stops_at_once(project, monkeypatch):
+    calls = []
+    def spend(prompt, cfg):
+        calls.append(1)
+        return gate.FixerResult(False, "summary", 0.3, budget_hit=True)
+    monkeypatch.setattr(gate, "call_fixer", spend)
+    assert gate.gate_loop(make_cfg(project, rounds=5, max_cost=1.0)) == gate.EXIT_BUDGET
+    assert len(calls) == 1

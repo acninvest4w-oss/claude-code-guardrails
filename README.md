@@ -39,8 +39,11 @@ How it closes the usual ways an agent "passes" tests:
 
 - **Edits the test** -> the hash snapshot catches it, and `--disallowedTools Edit(./tests/**)`
   refuses it up front.
-- **Skips/ignores the test via config** -> list the config files in `--protect`; new
-  files under protected dirs count as tampering.
+- **Skips/ignores the test via config** -> root test config (`conftest.py`, `pytest.ini`,
+  `pyproject.toml`, `setup.cfg`, `tox.ini`, `package.json`, jest/vitest config) is protected
+  automatically, *even before it exists*, so a new root `conftest.py` with `collect_ignore`
+  is caught. New files under protected dirs count too. Nested config elsewhere: add it to
+  `--protect`. If the fix really needs a new dependency, `--no-auto-protect`.
 - **Runs something else and reports success** -> the fixer has no shell at all
   (`--tools Read,Edit,Write,Grep,Glob`, MCP servers dropped). The gate runs the tests itself.
 - **Tests were never red** -> `--expect-red` fails if they pass before any fix, because
@@ -50,7 +53,10 @@ How it closes the usual ways an agent "passes" tests:
 - **Auth/API failure** -> abort after one round instead of looping on an error.
 - **Something hangs** -> `--test-timeout` / `--fixer-timeout` (default 30 min each) kill
   the whole process tree, not just the shell, so a grandchild holding the pipes can't
-  stall the gate. `--max-cost` (USD) stops between rounds once the fixer spend reaches it.
+  stall the gate.
+- **Runaway spend** -> `--max-cost` (USD, default 5, `0` = no cap). The remaining budget
+  is passed to each fixer call as `--max-budget-usd`, so the CLI stops itself mid-round;
+  the overshoot is at most one API call, not a whole round.
 
 The log keeps the tail plus early `Traceback`/`FAILED` lines a plain tail would cut off,
 so the fixer sees the root cause and not just the summary line.
@@ -86,9 +92,9 @@ So `guard.js` splits by event:
 |---|---|---|---|
 | `git-add-all` | block | `git add -A` / `--all` / `.` / `*` / `:/` without `-n`/`--dry-run`, checked per chained command (`;` `&&` `\|\|` `\|` `&`), with `git -C`/`-c` prefixes | stages `.env`, keys and data dumps along with the change |
 | `gpg-commit` | block | `git commit` while `commit.gpgsign=true` | the signing prompt hung the agent terminal |
-| `guard-config` | block | edits to `.claude/guardrails.json`, `.claude/settings*.json` or `guard.js` itself | the agent must not switch its own guard off |
-| `readonly-dir` | block | edits under a `readonly` dir, after resolving `..` and symlinks/junctions | cloned reference repos are for reading; patterns get copied out, not patched in place |
-| `secret` | block | hardcoded keys/tokens (OpenAI, Anthropic, Gemini, GitHub, Slack, Telegram, Bearer); `.env` / `.env.*` exempt | a key pasted into code ends up in git history; blocked before it touches disk |
+| `guard-config` | block | edits to `.claude/guardrails.json`, `.claude/settings*.json` or `guard.js` itself, by Edit/Write or a shell write | the agent must not switch its own guard off |
+| `readonly-dir` | block | edits under a `readonly` dir, by Edit/Write or a shell write; `..` and symlinks/junctions resolved both ways (see below) | cloned reference repos are for reading; patterns get copied out, not patched in place |
+| `secret` | block | hardcoded keys/tokens (OpenAI, Anthropic, Gemini, GitHub, Slack, Telegram, Bearer) in an edit or a shell command that writes a file; `.env` / `.env.*` exempt | a key pasted into code ends up in git history; blocked before it touches disk |
 | `logger-non-ascii` | block | non-ASCII in Python `logger.*()` | emoji in a log line crashed async tasks on a cp1252 Windows VPS, 5+ times |
 | `broad-except-py` | warn | `except Exception` in Python | a blanket catch hides the error you need when something breaks |
 | `empty-catch-js` | warn | empty `catch {}` in JS/TS | same failure in JS: the error just disappears |
@@ -128,18 +134,27 @@ your tools.
 
 A seatbelt against agent mistakes, not a sandbox against an adversary.
 
-- It reads `Edit`/`Write`/`MultiEdit` input and the Bash **command string**. A shell
-  redirect (`echo key > file`), `sed -i`, or a script the agent writes and runs are not
-  parsed. For hard file boundaries use `permissions.deny` (e.g. `Edit(./vendor/**)`) and
-  Claude Code's sandbox; this hook adds the *explanation* the model needs to stop retrying.
+- It reads `Edit`/`Write`/`MultiEdit` input and the Bash **command string**. In Bash it
+  finds the write targets of redirects (`>`, `>>`, `2>`), `tee`, `sed -i`, `cp`/`mv`/`ln`/
+  `install`, `rm`/`touch`/`truncate` and `dd of=`, per chained command. It does not follow
+  a script the agent writes and then runs, `python -c`, variables, `eval`, or the
+  PowerShell tool. For hard file boundaries use `permissions.deny` (e.g. `Edit(./vendor/**)`)
+  and Claude Code's sandbox; this hook adds the *explanation* the model needs to stop retrying.
+- Paths are judged both ways an OS may resolve them: `..` first, then links (Windows,
+  `path.resolve`), and links first, then `..` (a POSIX kernel: with `alias -> vendor/sub`,
+  `alias/../x` is `vendor/x`). If either lands in a protected place, the call is blocked.
+- A Bash command that carries a token *and* writes a file is blocked, e.g.
+  `curl -H "Authorization: Bearer ..." > out.json`. Put the token in an env var.
 - `GUARDRAILS_OFF` / `GUARDRAILS_READONLY` come from the environment Claude Code was
   started with. An `export` inside the agent's Bash tool does not reach the hook.
 - Fail-open is deliberate: a crashing guard that blocked every tool call would be
   switched off by its user within a day.
 
 Bypass attempts are tested in [`hooks/tests/guard.test.js`](hooks/tests/guard.test.js)
-("red team"): `..` traversal, junction/symlink into a read-only dir, `git add -A --dry-run;
-git add -A`, `git -C sub add -A`, quoted and subshell forms, edits to the guard's own config.
+("red team"): `..` traversal, junction/symlink into a read-only dir, a link followed by
+`..`, shell writes (`echo > vendor/x`, `sed -i`, `cp`, `rm -rf vendor`, `tee`), `git add -A
+--dry-run; git add -A`, `git -C sub add -A`, quoted and subshell forms, edits to the guard's
+own config.
 
 **Windows:** each hook spawns `node` in a new console, so a window flashes on every
 tool call. [`hooks/hide.py`](hooks/hide.py) runs it under `pythonw` with
