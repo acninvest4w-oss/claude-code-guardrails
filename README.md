@@ -27,7 +27,8 @@ python gate/test_gate.py \
 
 What happens:
 
-1. Snapshot every protected file (bytes, not mtimes).
+1. Snapshot every protected file: a sha256 in memory, the original copied to a temp dir
+   on disk. Large fixtures (images, dumps) never sit in RAM.
 2. Run the tests. Exit 0 -> done. Red -> send the task + a trimmed failure log to
    `claude -p`.
 3. After each fixer round, diff the snapshot. Any protected file changed, added or
@@ -36,7 +37,7 @@ What happens:
 
 How it closes the usual ways an agent "passes" tests:
 
-- **Edits the test** -> byte snapshot catches it, and `--disallowedTools Edit(./tests/**)`
+- **Edits the test** -> the hash snapshot catches it, and `--disallowedTools Edit(./tests/**)`
   refuses it up front.
 - **Skips/ignores the test via config** -> list the config files in `--protect`; new
   files under protected dirs count as tampering.
@@ -76,26 +77,46 @@ So `guard.js` splits by event:
 - **PostToolUse, exit 2 -> WARN.** The edit already happened; Claude gets the reason
   and fixes what it just wrote.
 
-| Rule | Type | Why it exists |
-|---|---|---|
-| `git add -A` / `--all` / `.` without `--dry-run` | block | stages `.env`, keys and data dumps along with the change |
-| `git commit` while `commit.gpgsign=true` | block | the signing prompt hung the agent terminal |
-| Non-ASCII in Python `logger.*()` | block | emoji in a log line crashed async tasks on a cp1252 Windows VPS, 5+ times |
-| Edits under `GUARDRAILS_READONLY` dirs | block | cloned reference repos are for reading; patterns get copied out, not patched in place |
-| Hardcoded API keys/tokens (OpenAI, Anthropic, Gemini, GitHub, Slack, Telegram, Bearer) | warn | `.env*` files are skipped |
-| `except Exception` in Python | warn | a blanket catch hides the error you need when something breaks |
-| Telegram send with `&lt;` entities but no `parse_mode=HTML` | warn | users of a scanner bot saw raw `&lt;b&gt;`, more than once |
-| Unicode arrows/dashes in `.ps1/.bat/.cmd` | warn | Windows PowerShell 5.1 reads BOM-less UTF-8 as ANSI and mangles them |
+| Rule id | Type | What | Why it exists |
+|---|---|---|---|
+| `git-add-all` | block | `git add -A` / `--all` / `.` without `--dry-run` | stages `.env`, keys and data dumps along with the change |
+| `gpg-commit` | block | `git commit` while `commit.gpgsign=true` | the signing prompt hung the agent terminal |
+| `readonly-dir` | block | edits under a `readonly` dir | cloned reference repos are for reading; patterns get copied out, not patched in place |
+| `logger-non-ascii` | block | non-ASCII in Python `logger.*()` | emoji in a log line crashed async tasks on a cp1252 Windows VPS, 5+ times |
+| `secret` | warn | hardcoded keys/tokens (OpenAI, Anthropic, Gemini, GitHub, Slack, Telegram, Bearer); `.env*` skipped | a key pasted into code ends up in git history |
+| `broad-except-py` | warn | `except Exception` in Python | a blanket catch hides the error you need when something breaks |
+| `empty-catch-js` | warn | empty `catch {}` in JS/TS | same failure in JS: the error just disappears |
+| `telegram-parse-mode` | warn | Telegram send with `&lt;` entities but no `parse_mode=HTML` | users of a scanner bot saw raw `&lt;b&gt;`, more than once |
+| `unicode-win-script` | warn | Unicode arrows/dashes in `.ps1/.bat/.cmd` | Windows PowerShell 5.1 reads BOM-less UTF-8 as ANSI and mangles them |
+
+Every message starts with its rule id, so turning one off is a one-line config change.
 
 Install: copy `hooks/guard.js` to `.claude/hooks/` and merge
 [`examples/settings.json`](examples/settings.json) into `.claude/settings.json`.
 
-```bash
-GUARDRAILS_OFF=1                        # bypass everything for one session
-GUARDRAILS_READONLY=vendor/,third_party/  # comma-separated read-only dirs
+Configure per project in `.claude/guardrails.json` (optional, no code edits):
+
+```json
+{
+  "disable": ["telegram-parse-mode", "logger-non-ascii"],
+  "readonly": ["vendor/", "third_party/sdk"]
+}
 ```
 
-Bad hook input fails open: a bug in the guard never blocks your tools.
+`readonly` entries are anchored at the project root (`$CLAUDE_PROJECT_DIR`) and match
+whole path segments: `lib/` protects `<root>/lib/**`, not `src/lib/` or `mylib/`.
+Absolute paths work too.
+
+```bash
+GUARDRAILS_OFF=1                          # bypass everything for one session
+GUARDRAILS_READONLY=vendor/,third_party/  # extra read-only dirs, same matching
+```
+
+Adding a rule is one object in `BLOCK_RULES` or `WARN_RULES`: an `id`, the tool it
+applies to, an optional file regex, and a `check` that returns a message or nothing.
+
+Bad hook input or a broken config file fails open: a bug in the guard never blocks
+your tools.
 
 **Windows:** each hook spawns `node` in a new console, so a window flashes on every
 tool call. [`hooks/hide.py`](hooks/hide.py) runs it under `pythonw` with
