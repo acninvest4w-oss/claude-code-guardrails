@@ -128,6 +128,21 @@ Install: copy `hooks/guard.js` to `.claude/hooks/` and merge
 PreToolUse matcher must list `PowerShell` too: a hook that matches only `Bash` never sees
 the PowerShell tool, whatever the rules say.
 
+Several machines: instead of copies that drift, keep one clone per machine at a release
+tag and point the hook command at it; the tag is the version, the same tag everywhere is
+in sync, and going back is checking out the old tag.
+
+```bash
+git clone https://github.com/acninvest4w-oss/claude-code-guardrails C:/tools/claude-code-guardrails
+git -C C:/tools/claude-code-guardrails checkout v1.1.0      # update: fetch --tags, checkout the new tag
+git -C C:/tools/claude-code-guardrails describe --tags      # what this machine runs
+```
+
+Pin a tag rather than pulling `main` on a schedule: the hook runs on every tool call, so an
+auto-pull hands whoever can push to the repo code execution on every machine. Add the clone
+to `readonly` (absolute paths work) so the agent cannot edit the guard's files there;
+`guard-config` already covers `guard.js` itself, but not `hide.py` or a `git checkout`.
+
 Configure per project in `.claude/guardrails.json` (optional, no code edits):
 
 ```json
