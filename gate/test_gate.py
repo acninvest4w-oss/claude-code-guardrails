@@ -16,11 +16,18 @@ Exit codes: 0 pass | 1 still red after all rounds (call a human)
               pytest 4 = path not found, 5 = no tests) or --protect matched no file
             8 test command timed out (--test-timeout), process tree killed
             9 --max-cost budget reached before the tests went green
+            10 test exit 0 but --pass-pattern not in the output (no test really ran)
 
 Common test-config files (conftest.py, pytest.ini, pyproject.toml, package.json,
-jest/vitest config ...) at the project root are protected too, even before they
-exist, so a new root conftest.py with collect_ignore is caught. --no-auto-protect
-turns that off, e.g. when the fix legitimately needs a new dependency.
+jest/vitest config ...) and runner shadows (pytest.py, pytest/, unittest.py) at the
+project root are protected too, even before they exist, so a new root conftest.py
+with collect_ignore is caught. --no-auto-protect turns that off, e.g. when the fix
+legitimately needs a new dependency.
+
+Protected files are re-checked after every test run as well as after every fixer
+round: code under test that rewrites a test at import time is caught and reverted.
+What the gate cannot rule out is source code that fakes the run itself (prints a
+fake summary, special-cases inputs); review the diff for that.
 """
 from __future__ import annotations
 
@@ -46,14 +53,36 @@ EXIT_FIXER_FAILED = 6
 EXIT_BAD_SETUP = 7
 EXIT_TIMEOUT = 8
 EXIT_BUDGET = 9
+EXIT_NO_EVIDENCE = 10
 
 FIXER_TOOLS = "Read,Edit,Write,Grep,Glob"
 AUTO_PROTECT = (
     "conftest.py", "pytest.ini", "pyproject.toml", "setup.cfg", "tox.ini", ".coveragerc",
     "package.json", "jest.config.js", "jest.config.ts", "jest.config.mjs", "jest.config.cjs",
     "vitest.config.js", "vitest.config.ts", "vitest.config.mjs", "vitest.config.mts",
+    # a local module with the runner's name is imported instead of the real runner
+    "pytest.py", "pytest", "_pytest", "unittest.py", "unittest",
+    "sitecustomize.py", "usercustomize.py",
 )
+# --pass-pattern auto: a green run must show at least one passed test in the runner's own
+# output. pytest -qq prints only progress lines ("..s  [100%]"): one needs a "." in it,
+# so an all-skipped run ("s  [100%]") is not evidence.
+PASS_PATTERNS = (
+    (re.compile(r"\bpytest\b"), r"(?m)\b[1-9]\d* passed\b|^[.sxX]*\.[.sxX]*\s*\[\s*\d+%\]"),
+    (re.compile(r"\b(jest|vitest)\b"), r"\b[1-9]\d* passed\b"),
+    (re.compile(r"\bunittest\b"), "unittest"),  # counts, see unittest_passed
+)
+
+
+def unittest_passed(output: str) -> bool:
+    """unittest prints "Ran N tests" even when all N were skipped: N - skipped must be > 0."""
+    ran = re.search(r"\bRan (\d+) tests?\b", output)
+    if not ran:
+        return False
+    not_run = sum(int(n) for n in re.findall(r"(?:skipped|expected failures)=(\d+)", output))
+    return int(ran.group(1)) - not_run > 0
 BUDGET_SUBTYPE = "error_max_budget_usd"
+DRAIN_TIMEOUT = 5  # seconds to collect output after a kill; a detached survivor may hold the pipe
 IGNORED_PARTS = {"__pycache__", ".pytest_cache", "bin", "obj", "node_modules"}
 FAIL_MARKERS = re.compile(r"FAILED|ERROR|Error:|AssertionError|assert |Traceback")
 EARLY_FAIL_LINES = 20
@@ -106,8 +135,21 @@ def run_proc(cmd: str | list[str], cwd: Path, timeout: float, **kw: object) -> P
         return ProcResult(proc.returncode, out or b"", err or b"")
     except subprocess.TimeoutExpired:
         kill_tree(proc)
-        out, err = proc.communicate()
-        return ProcResult(None, out or b"", err or b"")
+        return ProcResult(None, *drain(proc))
+
+
+def drain(proc: subprocess.Popen) -> tuple[bytes, bytes]:
+    """Output of a killed tree, bounded: a detached survivor (own session, orphaned
+    on Windows) is outside the kill but may still hold the pipe open.
+
+    The pipes are left open on purpose: on Windows, close() waits for the blocked
+    reader thread, i.e. for the survivor to exit.
+    """
+    try:
+        out, err = proc.communicate(timeout=DRAIN_TIMEOUT)
+        return out or b"", err or b""
+    except subprocess.TimeoutExpired as exc:
+        return exc.stdout or b"", exc.stderr or b""
 
 
 def run_tests(cmd: str, cwd: Path, timeout: float) -> TestRun:
@@ -247,19 +289,54 @@ def gate_loop(cfg: argparse.Namespace) -> int:
     """Test -> fix -> test until green, tampered, or out of rounds."""
     before = snapshot(cfg.protect, cfg.cwd, cfg.log_dir / "protected")
     for rnd in range(cfg.rounds + 1):
-        run = run_tests(cfg.test, cfg.cwd, cfg.test_timeout)
-        save_log(cfg, f"test_{rnd}.log", run.output)
-        stop = judge_run(cfg, run, f"test_{rnd}.log", rnd)
+        stop, run = run_and_judge(cfg, before, rnd)
         if stop is not None:
             return stop
         if rnd == cfg.rounds:
             break
         stop = fix_round(cfg, run, rnd + 1, before)
+        if stop == EXIT_BUDGET:
+            return verify_at_budget(cfg, before, rnd + 1)
         if stop is not None:
             return stop
     print(f"[gate] STILL RED after {cfg.rounds} rounds -> human needed. "
           f"Cost ${cfg.cost:.2f}. Logs: {cfg.log_dir}")
     return EXIT_STILL_RED
+
+
+def run_and_judge(cfg: argparse.Namespace, before: Snapshot,
+                  rnd: int) -> tuple[int | None, TestRun]:
+    """One test run, then the protected files again: code under test can write too."""
+    run = run_tests(cfg.test, cfg.cwd, cfg.test_timeout)
+    log_name = f"test_{rnd}.log"
+    save_log(cfg, log_name, run.output)
+    tampered = find_tampered(before, cfg.protect, cfg.cwd)
+    if tampered:
+        return report_tampered(before, tampered, cfg), run
+    return judge_run(cfg, run, log_name, rnd), run
+
+
+def verify_at_budget(cfg: argparse.Namespace, before: Snapshot, rnd: int) -> int:
+    """The budget stops further fixing, not the check of the fix already made."""
+    stop, _ = run_and_judge(cfg, before, rnd)
+    if stop is not None:
+        return stop
+    print(f"[gate] STOP: spent ${cfg.cost:.2f} >= --max-cost ${cfg.max_cost:.2f}, "
+          f"still red. Logs: {cfg.log_dir}")
+    return EXIT_BUDGET
+
+
+def missing_evidence(cfg: argparse.Namespace, run: TestRun, log_name: str) -> bool:
+    """Exit 0 must come with the runner's own pass summary (os._exit(0) at import has none)."""
+    if not cfg.pass_pattern:
+        return False
+    if cfg.pass_pattern == "unittest" and unittest_passed(run.output):
+        return False
+    if cfg.pass_pattern != "unittest" and re.search(cfg.pass_pattern, run.output):
+        return False
+    print(f"[gate] ABORT: test exit 0 but --pass-pattern '{cfg.pass_pattern}' is not in the "
+          f"output: no test really ran. Log: {cfg.log_dir / log_name}")
+    return True
 
 
 def judge_run(cfg: argparse.Namespace, run: TestRun, log_name: str, rnd: int) -> int | None:
@@ -269,7 +346,7 @@ def judge_run(cfg: argparse.Namespace, run: TestRun, log_name: str, rnd: int) ->
               f"process tree killed. Log: {cfg.log_dir / log_name}")
         return EXIT_TIMEOUT
     if run.code == 0:
-        return report_green(cfg, rnd)
+        return EXIT_NO_EVIDENCE if missing_evidence(cfg, run, log_name) else report_green(cfg, rnd)
     if run.code not in cfg.red_codes:
         return report_bad_command(cfg, run.code, log_name)
     return None
@@ -296,9 +373,7 @@ def fix_round(cfg: argparse.Namespace, run: TestRun, rnd: int,
               f"see fixer_{rnd}.txt in {cfg.log_dir}")
         return EXIT_FIXER_FAILED
     if over_budget(cfg, res):
-        print(f"[gate] STOP: spent ${cfg.cost:.2f} >= --max-cost ${cfg.max_cost:.2f}. "
-              f"Logs: {cfg.log_dir}")
-        return EXIT_BUDGET
+        return EXIT_BUDGET  # the caller still verifies this round's fix
     return None
 
 
@@ -326,18 +401,24 @@ def report_tampered(before: Snapshot, tampered: list[Path],
     """Undo edits to protected files and abort; the fix cannot be trusted."""
     restore(before, tampered)
     names = ", ".join(str(f.relative_to(cfg.cwd)) for f in tampered)
-    print(f"[gate] ABORT: fixer touched protected files (reverted): {names}. "
-          f"Logs: {cfg.log_dir}")
+    print(f"[gate] ABORT: protected files changed by the fixer or by code under test "
+          f"(reverted): {names}. Logs: {cfg.log_dir}")
     return EXIT_TAMPERED
 
 
 def run_check(cfg: argparse.Namespace) -> int:
-    """Single run, no fixer: report the test exit code as the verdict."""
+    """Single run, no fixer: the test exit code is the verdict, protected files still checked."""
+    before = snapshot(cfg.protect, cfg.cwd, cfg.log_dir / "protected")
     run = run_tests(cfg.test, cfg.cwd, cfg.test_timeout)
     save_log(cfg, "check.log", run.output)
+    tampered = find_tampered(before, cfg.protect, cfg.cwd)
+    if tampered:
+        return report_tampered(before, tampered, cfg)
     if run.code is None:
         print(f"[gate] TIMEOUT after {cfg.test_timeout:g}s. Log: {cfg.log_dir / 'check.log'}")
         return EXIT_TIMEOUT
+    if run.code == 0 and missing_evidence(cfg, run, "check.log"):
+        return EXIT_NO_EVIDENCE
     verdict = "PASS" if run.code == 0 else "FAIL"
     print(f"[gate] {verdict}: test exit {run.code}. Log: {cfg.log_dir / 'check.log'}")
     return EXIT_PASS if run.code == 0 else EXIT_STILL_RED
@@ -364,12 +445,17 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
                     help="seconds per fixer call before it is killed")
     ap.add_argument("--max-cost", type=float, default=5.0,
                     help="USD cap on fixer spend, enforced inside each call (0 = no cap)")
+    ap.add_argument("--pass-pattern", default="auto",
+                    help="regex a green run must print; auto = pytest/jest/vitest summary, "
+                         "'' = off")
     ap.add_argument("--no-auto-protect", action="store_true",
                     help="do not protect root test-config files (pyproject.toml, conftest.py ...)")
     ap.add_argument("--cwd", default=".")
     cfg = ap.parse_args(argv)
     cfg.cwd = Path(cfg.cwd).resolve()
     cfg.red_codes = {int(c) for c in cfg.red_codes.split(",")}
+    if cfg.pass_pattern == "auto":
+        cfg.pass_pattern = next((pat for runner, pat in PASS_PATTERNS if runner.search(cfg.test)), "")
     cfg.explicit_protect = list(cfg.protect)
     if not cfg.no_auto_protect:
         cfg.protect += [n for n in AUTO_PROTECT if n not in cfg.protect]

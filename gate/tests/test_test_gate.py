@@ -241,3 +241,114 @@ def test_budget_hit_inside_a_round_stops_at_once(project, monkeypatch):
     monkeypatch.setattr(gate, "call_fixer", spend)
     assert gate.gate_loop(make_cfg(project, rounds=5, max_cost=1.0)) == gate.EXIT_BUDGET
     assert len(calls) == 1
+
+
+# Codex review round 1: ways to a fake green.
+IMPORT_TAMPER = (
+    "from pathlib import Path\n"
+    "Path('tests/test_calc.py').write_text('def test_add():\\n    assert True\\n')\n"
+    "def add(a, b):\n    return a - b\n")
+
+
+def test_tests_rewritten_during_the_test_run_are_caught(project, monkeypatch):
+    monkeypatch.setattr(gate, "call_fixer", fake_fixer(
+        lambda cwd, p: (cwd / "calc.py").write_text(IMPORT_TAMPER)))
+    assert gate.gate_loop(make_cfg(project)) == gate.EXIT_TAMPERED
+    assert (project / "tests" / "test_calc.py").read_text() == TEST
+
+
+def test_shadowing_the_test_runner_is_caught(project, monkeypatch):
+    monkeypatch.setattr(gate, "call_fixer", fake_fixer(
+        lambda cwd, p: (cwd / "pytest.py").write_text("raise SystemExit(0)\n")))
+    assert gate.gate_loop(make_cfg(project)) == gate.EXIT_TAMPERED
+    assert not (project / "pytest.py").exists()
+
+
+def test_exit_0_without_passing_tests_in_the_output_is_not_green(project, monkeypatch):
+    monkeypatch.setattr(gate, "call_fixer", fake_fixer(
+        lambda cwd, p: (cwd / "calc.py").write_text("import os\nos._exit(0)\n")))
+    assert gate.gate_loop(make_cfg(project)) == gate.EXIT_NO_EVIDENCE
+
+
+def test_pass_pattern_defaults_by_runner_and_can_be_disabled(project):
+    base = ["--cwd", str(project)]
+    assert gate.parse_args(["--test", "python -m pytest -q", *base]).pass_pattern
+    assert gate.parse_args(["--test", "npx jest", *base]).pass_pattern
+    assert not gate.parse_args(["--test", "make test", *base]).pass_pattern
+    assert not gate.parse_args(["--test", "pytest", "--pass-pattern", "", *base]).pass_pattern
+
+
+def test_a_fix_that_reaches_the_budget_is_still_verified(project, monkeypatch):
+    def fix_at_cap(prompt, cfg):
+        (cfg.cwd / "calc.py").write_text(FIXED)
+        return gate.FixerResult(False, "summary", 1.0, budget_hit=True)
+    monkeypatch.setattr(gate, "call_fixer", fix_at_cap)
+    assert gate.gate_loop(make_cfg(project, max_cost=1.0)) == gate.EXIT_PASS
+
+
+def test_detached_survivor_holding_the_pipe_cannot_stall_the_gate(project):
+    # spawn.py starts a child in its own session/group and exits at once, so the child
+    # is outside the tree the gate kills, yet it still holds the output pipe.
+    (project / "spawn.py").write_text(
+        "import os, subprocess, sys\n"
+        "kw = {'creationflags': 0x00000200} if os.name == 'nt' else {'start_new_session': True}\n"
+        "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(25)'], **kw)\n")
+    py = f'"{sys.executable}"'
+    cfg = make_cfg(project, test=f'{py} spawn.py && {py} -c "import time; time.sleep(60)"',
+                   test_timeout=2)
+    started = time.monotonic()
+    assert gate.run_check(cfg) == gate.EXIT_TIMEOUT
+    assert time.monotonic() - started < 20
+
+
+# Codex review round 2.
+def test_check_mode_also_catches_and_reverts_protected_changes(project):
+    (project / "calc.py").write_text(
+        "from pathlib import Path\nPath('tests/added.txt').write_text('x')\n" + FIXED)
+    assert gate.run_check(make_cfg(project)) == gate.EXIT_TAMPERED
+    assert not (project / "tests" / "added.txt").exists()
+
+
+def test_unittest_package_shadow_is_protected(project, monkeypatch):
+    def shadow(cwd, prompt):
+        (cwd / "unittest").mkdir()
+        (cwd / "unittest" / "__init__.py").write_text("raise SystemExit(0)\n")
+    monkeypatch.setattr(gate, "call_fixer", fake_fixer(shadow))
+    assert gate.gate_loop(make_cfg(project)) == gate.EXIT_TAMPERED
+    assert not (project / "unittest" / "__init__.py").exists()
+
+
+def test_quiet_pytest_and_unittest_count_as_evidence(project):
+    (project / "calc.py").write_text(FIXED)
+    qq = f'"{sys.executable}" -B -m pytest -qq -p no:cacheprovider tests'
+    cfg = make_cfg(project, test=qq)
+    cfg.pass_pattern = gate.parse_args(["--test", qq, "--cwd", str(project)]).pass_pattern
+    assert gate.run_check(cfg) == gate.EXIT_PASS
+    ut = gate.parse_args(["--test", "python -m unittest discover", "--cwd", str(project)])
+    assert ut.pass_pattern and "unittest" in ut.protect
+
+
+# Codex review round 3.
+def test_all_skipped_quiet_run_is_not_evidence(project):
+    (project / "calc.py").write_text(
+        "import pytest\n\ndef add(a, b):\n    pytest.skip('temporarily unavailable')\n")
+    qq = f'"{sys.executable}" -B -m pytest -qq -p no:cacheprovider tests'
+    cfg = make_cfg(project, test=qq)
+    cfg.pass_pattern = gate.parse_args(["--test", qq, "--cwd", str(project)]).pass_pattern
+    assert gate.run_check(cfg) == gate.EXIT_NO_EVIDENCE
+    q = make_cfg(project)
+    assert gate.run_check(q) == gate.EXIT_NO_EVIDENCE  # "1 skipped" has no "passed" either
+
+
+# Codex review round 4.
+def test_unittest_evidence_needs_a_test_that_ran(project):
+    assert gate.unittest_passed("Ran 2 tests in 0.001s\n\nOK (skipped=1)")
+    assert not gate.unittest_passed("Ran 1 test in 0.001s\n\nOK (skipped=1)")
+    assert not gate.unittest_passed("Ran 2 tests\n\nOK (skipped=1, expected failures=1)")
+    assert not gate.unittest_passed("Ran 0 tests in 0.000s\n\nNO TESTS RAN")
+    (project / "calc.py").write_text("import unittest\nraise unittest.SkipTest('unavailable')\n")
+    (project / "tests" / "__init__.py").write_text("")
+    cmd = f'"{sys.executable}" -B -m unittest discover -s tests -t .'
+    cfg = make_cfg(project, test=cmd)
+    cfg.pass_pattern = gate.parse_args(["--test", cmd, "--cwd", str(project)]).pass_pattern
+    assert gate.run_check(cfg) == gate.EXIT_NO_EVIDENCE

@@ -31,8 +31,9 @@ What happens:
    on disk. Large fixtures (images, dumps) never sit in RAM.
 2. Run the tests. Exit 0 -> done. Red -> send the task + a trimmed failure log to
    `claude -p`.
-3. After each fixer round, diff the snapshot. Any protected file changed, added or
-   deleted -> **reverted and aborted**. A `conftest.py` with `collect_ignore` counts.
+3. After each fixer round *and after each test run*, diff the snapshot. Any protected
+   file changed, added or deleted -> **reverted and aborted**. A `conftest.py` with
+   `collect_ignore` counts, and so does source code that rewrites a test when imported.
 4. Repeat until green or out of rounds, then hand back to a human.
 
 How it closes the usual ways an agent "passes" tests:
@@ -44,6 +45,15 @@ How it closes the usual ways an agent "passes" tests:
   automatically, *even before it exists*, so a new root `conftest.py` with `collect_ignore`
   is caught. New files under protected dirs count too. Nested config elsewhere: add it to
   `--protect`. If the fix really needs a new dependency, `--no-auto-protect`.
+- **Shadows the test runner** -> a root `pytest.py`, `pytest/`, `unittest.py`, `unittest/` or
+  `sitecustomize.py` would be imported instead of the real runner; they are auto-protected
+  the same way.
+- **Makes the run exit 0 without running tests** (`os._exit(0)` at import, an empty
+  selection) -> `--pass-pattern` must appear in the output. `auto` picks the runner's own
+  summary with at least one passed test: pytest `N passed` (under `-qq`, a progress line
+  with a `.`; an all-skipped `s [100%]` does not count), jest/vitest `N passed`, unittest
+  `Ran N tests` minus skipped and expected failures. Pass a regex for other runners, `''`
+  for none.
 - **Runs something else and reports success** -> the fixer has no shell at all
   (`--tools Read,Edit,Write,Grep,Glob`, MCP servers dropped). The gate runs the tests itself.
 - **Tests were never red** -> `--expect-red` fails if they pass before any fix, because
@@ -52,11 +62,12 @@ How it closes the usual ways an agent "passes" tests:
   `--red-codes` abort before burning a fixer call. So does `--protect` matching nothing.
 - **Auth/API failure** -> abort after one round instead of looping on an error.
 - **Something hangs** -> `--test-timeout` / `--fixer-timeout` (default 30 min each) kill
-  the whole process tree, not just the shell, so a grandchild holding the pipes can't
-  stall the gate.
+  the whole process tree, not just the shell. Collecting output after the kill is bounded
+  too, so a detached survivor still holding the pipe can't stall the gate.
 - **Runaway spend** -> `--max-cost` (USD, default 5, `0` = no cap). The remaining budget
   is passed to each fixer call as `--max-budget-usd`, so the CLI stops itself mid-round;
-  the overshoot is at most one API call, not a whole round.
+  the overshoot is at most one API call, not a whole round. A fix made in the round that
+  hits the cap is still tested before the gate gives up.
 
 The log keeps the tail plus early `Traceback`/`FAILED` lines a plain tail would cut off,
 so the fixer sees the root cause and not just the summary line.
@@ -65,15 +76,22 @@ so the fixer sees the root cause and not just the summary line.
 |---|---|
 | 0 | tests exit 0, protected files intact |
 | 1 | still red after `--rounds` (human needed) |
-| 3 | fixer touched protected files (reverted) |
+| 3 | protected files changed by the fixer or by code under test (reverted) |
 | 4 | `--expect-red` but already green |
 | 5 | `claude` CLI not on PATH |
 | 6 | fixer call failed (auth/API) or timed out |
 | 7 | bad setup: test command crashed or `--protect` matched nothing |
 | 8 | test command timed out (process tree killed) |
-| 9 | `--max-cost` reached before green |
+| 9 | `--max-cost` reached and still red |
+| 10 | exit 0 but `--pass-pattern` not in the output (no test really ran) |
 
-`--check` runs the tests once with no fixer, for CI or a quick verdict.
+**The limit:** the fixer's code runs inside your test process. The gate rules out tampering
+with tests, test config and the runner, and a run with no tests in it. It cannot rule out
+source that fakes the run itself (prints a fake summary) or special-cases test inputs: that
+is a code review question, which is what the reviewer below is for.
+
+`--check` runs the tests once with no fixer, for CI or a quick verdict. It still snapshots
+and re-checks the protected files and the pass pattern.
 Full logs go to a temp dir; the console only gets ASCII status lines.
 
 ## 2. Hooks: block what hurts, warn where the model can see it
@@ -127,18 +145,32 @@ GUARDRAILS_READONLY=vendor/,third_party/  # extra read-only dirs, same matching
 Adding a rule is one object in `BLOCK_RULES` or `WARN_RULES`: an `id`, the tool it
 applies to, an optional file regex, and a `check` that returns a message or nothing.
 
-Bad hook input or a broken config file fails open: a bug in the guard never blocks
-your tools.
+Bad hook input (not JSON) or a broken config file fails open: the guard never locks you
+out of your tools. A rule that throws on valid input does the opposite and stops that
+call with the error, because a crash exits 1, which Claude Code treats as "go ahead".
 
 ### What this is not
 
 A seatbelt against agent mistakes, not a sandbox against an adversary.
 
-- It reads `Edit`/`Write`/`MultiEdit` input and the Bash **command string**. In Bash it
-  finds the write targets of redirects (`>`, `>>`, `2>`), `tee`, `sed -i`, `cp`/`mv`/`ln`/
-  `install`, `rm`/`touch`/`truncate` and `dd of=`, per chained command. It does not follow
-  a script the agent writes and then runs, `python -c`, variables, `eval`, or the
-  PowerShell tool. For hard file boundaries use `permissions.deny` (e.g. `Edit(./vendor/**)`)
+- It reads `Edit`/`Write`/`MultiEdit` input and the Bash **command string**. Bash is
+  tokenized like a shell (`''`, `""`, `$''` quotes, escapes, comments, heredoc bodies
+  skipped, `if`/`{` keywords, `sudo`/`env`/`command` wrappers with their options).
+  Relative paths follow the shell's real directory: literal `cd`, `cd -`, `pushd`/`popd`,
+  `env -C`, with `( )`, `$( )`, pipelines, `&` jobs and piped/backgrounded `{ }` groups not
+  moving the parent. A `cd` that may be skipped (after `&&`/`||`, inside `if`/`for`/
+  `while`/`case`) or fail (target not a directory) keeps the old directory possible too,
+  and a write is checked against every possibility. This approximates bash, it does not
+  run it: where the outcome depends on exit statuses or loop counts, the guard keeps
+  every candidate directory, and past 8 candidates it stops the call instead of guessing. It finds what these
+  write or remove: redirects, `tee`, `touch`, `truncate`, `sed -i`, `dd of=`, `rm`/`rmdir`
+  (and their parent dirs: `rm -rf .claude`), `mv` sources and destinations, `cp`/`install`/
+  `ln` into a dir (`cp x .claude/`, `-t`/`--target-directory`). Globs are expanded against
+  the real directory like bash does (`rm *.log` is fine, `rm -rf *` at the root is not,
+  a quoted `'*'` is a literal name), braces `{a,b}` and `{1..3}` too; past 2000 expanded
+  names the call is stopped rather than checked partially. It does not follow a script the agent writes and then
+  runs, `python -c`, `$variables` (`cd $DIR`), `eval`, `bash <<EOF`, `xargs`, `find -delete`,
+  or the PowerShell tool. For hard file boundaries use `permissions.deny` (e.g. `Edit(./vendor/**)`)
   and Claude Code's sandbox; this hook adds the *explanation* the model needs to stop retrying.
 - Paths are judged both ways an OS may resolve them: `..` first, then links (Windows,
   `path.resolve`), and links first, then `..` (a POSIX kernel: with `alias -> vendor/sub`,
@@ -147,14 +179,17 @@ A seatbelt against agent mistakes, not a sandbox against an adversary.
   `curl -H "Authorization: Bearer ..." > out.json`. Put the token in an env var.
 - `GUARDRAILS_OFF` / `GUARDRAILS_READONLY` come from the environment Claude Code was
   started with. An `export` inside the agent's Bash tool does not reach the hook.
-- Fail-open is deliberate: a crashing guard that blocked every tool call would be
-  switched off by its user within a day.
+- Fail-open on unreadable input is deliberate: a guard that blocked every tool call
+  whenever something looked odd would be switched off by its user within a day.
 
 Bypass attempts are tested in [`hooks/tests/guard.test.js`](hooks/tests/guard.test.js)
 ("red team"): `..` traversal, junction/symlink into a read-only dir, a link followed by
-`..`, shell writes (`echo > vendor/x`, `sed -i`, `cp`, `rm -rf vendor`, `tee`), `git add -A
---dry-run; git add -A`, `git -C sub add -A`, quoted and subshell forms, edits to the guard's
-own config.
+`..`, shell writes (`echo > vendor/x`, `cd vendor && ...`, `sed -i 's|a|b|'`, `mv` out,
+`rm -rf .claude`, `cp x .claude/`, quoted paths with spaces, `cd /tmp > file`,
+`(cd /tmp); ...`, `pushd`/`popd`, `$'...'`, a glob through a symlink), `git add -A
+--dry-run; git add -A`, `"git" add -A`, `command -- git add -A`, `git add -- . -n`, a
+`.env` symlink into source, edits to the guard's own config. A sweep of everyday commands
+(`rm -f *.log`, `cp .env.example .env`, heredocs, `2>&1`) checks that none are blocked.
 
 **Windows:** each hook spawns `node` in a new console, so a window flashes on every
 tool call. [`hooks/hide.py`](hooks/hide.py) runs it under `pythonw` with
