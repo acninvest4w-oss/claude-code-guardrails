@@ -9,6 +9,12 @@
 // Config: <project>/.claude/guardrails.json
 //   { "disable": ["telegram-parse-mode"], "readonly": ["vendor/", "third_party/"] }
 // Env:    GUARDRAILS_OFF=1 bypasses everything; GUARDRAILS_READONLY=a/,b/ adds read-only dirs.
+//         Both are read from the environment Claude Code was started with; an
+//         `export` inside the agent's Bash tool does not reach this process.
+//
+// Scope: this is a seatbelt against agent mistakes, not a sandbox. It sees Edit/Write/
+// MultiEdit and the Bash command string; a shell redirect (echo > file) is not parsed.
+// Hard boundaries belong in permissions.deny and Claude Code's sandbox.
 const fs = require('fs');
 const nodePath = require('path');
 const { execSync } = require('child_process');
@@ -56,10 +62,34 @@ function loadConfig(root) {
 
 const isAbs = (p) => nodePath.isAbsolute(p) || /^[a-zA-Z]:/.test(p);
 
-// Absolute path as segments; Windows drive paths compare case-insensitively.
+// Resolve symlinks/junctions on the longest prefix that exists, keep the rest as is,
+// so a new file written through a linked dir is judged by where it really lands.
+function realExisting(p) {
+  const rest = [];
+  let cur = p;
+  while (!fs.existsSync(cur)) {
+    const up = nodePath.dirname(cur);
+    if (up === cur) return p;
+    rest.unshift(nodePath.basename(cur));
+    cur = up;
+  }
+  try {
+    return nodePath.join(fs.realpathSync.native(cur), ...rest);
+  } catch (e) {
+    return p; // unreadable ancestor: fall back to the lexical path
+  }
+}
+
+// Absolute, real path as segments: "..", "." and links resolved;
+// Windows drive paths compare case-insensitively.
 function fullSegments(p, root) {
   const joined = isAbs(p) ? p : `${root || ''}/${p}`;
-  const segs = joined.replace(/\\/g, '/').split('/').filter((s) => s && s !== '.');
+  const local = nodePath.isAbsolute(joined) ? realExisting(nodePath.normalize(joined)) : joined;
+  const segs = [];
+  for (const s of local.replace(/\\/g, '/').split('/')) {
+    if (s === '..') segs.pop();
+    else if (s && s !== '.') segs.push(s);
+  }
   return /^[a-zA-Z]:$/.test(segs[0] || '') ? segs.map((s) => s.toLowerCase()) : segs;
 }
 
@@ -71,23 +101,57 @@ function underDir(file, dir, root) {
   return d.length > 0 && d.length < f.length && d.every((s, i) => s === f[i]);
 }
 
+function samePath(a, b, root) {
+  const x = fullSegments(a, root);
+  const y = fullSegments(b, root);
+  return x.length === y.length && x.every((s, i) => s === y[i]);
+}
+
+// Files that switch the guard itself off; the agent may not edit them.
+const GUARD_FILES = ['.claude/guardrails.json', '.claude/settings.json',
+  '.claude/settings.local.json', __filename];
+
+// One shell command split into the commands it chains: ; && || | & and newlines.
+const subCommands = (cmd) => cmd.split(/&&|\|\||[;|&\n]/).map((s) => s.trim()).filter(Boolean);
+
+// `git [-C dir] [-c k=v] add <args>` with -A/--all/./*/:/ and no --dry-run/-n.
+function addsEverything(seg) {
+  const m = seg.match(/(?:^|[\s(`])git((?:\s+(?:-[cC]\s+\S+|--[\w-]+(?:=\S+)?))*)\s+add\b(.*)$/);
+  if (!m) return false;
+  const args = m[2].trim().split(/\s+/).map((a) => a.replace(/^["'(]+|["')`]+$/g, ''));
+  if (args.some((a) => a === '--dry-run' || a === '-n' || /^-[a-zA-Z]*n[a-zA-Z]*$/.test(a))) return false;
+  return args.some((a) => ['--all', '.', './', '*', ':/', ':'].includes(a) || /^-[a-zA-Z]*A[a-zA-Z]*$/.test(a));
+}
+
 // ------------------------------- rules -------------------------------
 // Each rule: id (used in messages and in "disable"), when it applies, check -> message | null.
 
 const BLOCK_RULES = [
   { id: 'git-add-all', tool: 'Bash',
-    check: (c) => /\bgit\s+add\s+(-A\b|--all\b|\.)(?!\S)/.test(c.cmd) && !/--dry-run/.test(c.cmd)
-      && 'git add -A/--all/. stages everything (.env, dumps, keys). '
-        + 'Add files by name, or run with --dry-run first and review.' },
+    check: (c) => subCommands(c.cmd).some(addsEverything)
+      && 'git add -A/--all/./* stages everything (.env, dumps, keys). '
+        + 'Add files by name, or run git add -n ... first and review.' },
   { id: 'gpg-commit', tool: 'Bash',
-    check: (c) => /\bgit\s+commit\b/.test(c.cmd) && !/-c\s+commit\.gpgsign/.test(c.cmd)
+    check: (c) => subCommands(c.cmd).some((s) => /\bgit\b.*\scommit\b/.test(s)
+        && !/-c\s+commit\.gpgsign/.test(s))
       && c.gpgsign() === 'true'
       && 'commit.gpgsign=true: the pinentry prompt hangs a non-interactive agent shell. '
         + 'Use git -c commit.gpgsign=false commit ..., or ask the user to commit.' },
+  { id: 'guard-config', tool: 'edit',
+    check: (c) => GUARD_FILES.some((g) => samePath(c.path, g, c.root))
+      && 'guardrail config and hook settings are edited by the user, not the agent. '
+        + 'Say what should change and why.' },
   { id: 'readonly-dir', tool: 'edit',
     check: (c) => {
       const hit = c.readonly.find((d) => underDir(c.path, d, c.root));
       return hit && `${hit} is read-only (config "readonly"). Copy the pattern elsewhere.`;
+    } },
+  { id: 'secret', tool: 'edit',
+    check: (c) => {
+      if (/(^|[\\/])\.env(\.[\w-]+)?$/.test(c.path)) return null;
+      const hits = SECRET_PATTERNS.filter(([, re]) => re.test(c.text)).map(([n]) => n);
+      return hits.length > 0 && `hardcoded secret (${hits.join(', ')}): not written. `
+        + 'Read it from an env var / .env instead.';
     } },
   { id: 'logger-non-ascii', tool: 'edit', file: PY,
     check: (c) => {
@@ -100,12 +164,6 @@ const BLOCK_RULES = [
 ];
 
 const WARN_RULES = [
-  { id: 'secret', tool: 'edit',
-    check: (c) => {
-      if (/\.env(\.|$)/.test(c.path)) return null;
-      const hits = SECRET_PATTERNS.filter(([, re]) => re.test(c.text)).map(([n]) => n);
-      return hits.length > 0 && `hardcoded secret (${hits.join(', ')}): move it to .env / env vars.`;
-    } },
   { id: 'broad-except-py', tool: 'edit', file: PY,
     check: (c) => {
       const n = (c.text.match(/except\s+Exception\b/g) || []).length;

@@ -5,6 +5,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 const { checkPre, checkPost, underDir, BLOCK_RULES, WARN_RULES } = require('../guard');
+const GUARD_ABS = require.resolve('../guard');
 
 const GUARD = path.join(__dirname, '..', 'guard.js');
 const ROOT = '/repo';
@@ -67,10 +68,16 @@ test('read-only dirs come from config and GUARDRAILS_READONLY', () => {
   assert.deepStrictEqual(checkPre(write('/repo/vendor/a.py', 'x = 1'), opts()), []);
 });
 
-test('post: secrets, broad except, empty JS catch, telegram parse_mode, unicode in .ps1', () => {
+test('secrets are blocked before they hit disk; .env files are exempt', () => {
   const key = 'sk-ant-' + 'a'.repeat(30);
-  assert.match(checkPost(write('cfg.py', `KEY = "${key}"`), opts())[0], /^\(secret\).*Anthropic/);
-  assert.deepStrictEqual(checkPost(write('.env', `KEY=${key}`), opts()), []);
+  assert.match(checkPre(write('cfg.py', `KEY = "${key}"`), opts())[0], /^\(secret\).*Anthropic/);
+  assert.deepStrictEqual(checkPre(write('.env', `KEY=${key}`), opts()), []);
+  assert.deepStrictEqual(checkPre(write('/repo/.env.local', `KEY=${key}`), opts()), []);
+  assert.strictEqual(checkPre(write('/repo/notes.env.md', key), opts()).length, 1);
+  assert.deepStrictEqual(checkPost(write('cfg.py', `KEY = "${key}"`), opts()), []);
+});
+
+test('post: broad except, empty JS catch, telegram parse_mode, unicode in .ps1', () => {
   assert.match(checkPost(write('a.py', 'try:\n  x()\nexcept Exception:\n  pass'), opts())[0], /1x/);
   assert.match(checkPost(write('a.ts', 'try { x() } catch (e) {}\ntry {} catch {  }'), opts())[0], /2x empty catch/);
   assert.deepStrictEqual(checkPost(write('a.ts', 'try { x() } catch (e) { log(e) }'), opts()), []);
@@ -136,4 +143,68 @@ test('process: bad config file fails open with a note, GUARDRAILS_OFF and bad JS
   assert.strictEqual(off.status, 0);
   const garbage = spawnSync(process.execPath, [GUARD], { input: 'not json', encoding: 'utf8' });
   assert.strictEqual(garbage.status, 0);
+});
+
+// ------------------------- red team: bypass attempts -------------------------
+
+test('red team: git add chained, flagged, quoted or via -C still blocked', () => {
+  for (const cmd of [
+    'git add -A --dry-run; git add -A', 'git add -n .; git add .', 'git status && git add --all',
+    'git add -Av', 'git -C sub add -A', 'git -c core.x=y add .', 'git add "."', 'git add -- .',
+    'git add *', 'git add :/', 'echo hi | git add -A', 'true || git add -A', 'git add -A &',
+    '(git add -A)', 'x=1\ngit add -A',
+  ]) assert.strictEqual(checkPre(bash(cmd), opts()).length, 1, JSON.stringify(cmd));
+  for (const cmd of [
+    'git add -A --dry-run', 'git add -nA', 'git add -n .', 'git add src/.env.example', 'git add ./src',
+    'git add .github/ci.yml', 'echo "git add -A is bad"', 'git log --all', 'git commit -a -m x',
+  ]) assert.deepStrictEqual(checkPre(bash(cmd), opts()), [], JSON.stringify(cmd));
+});
+
+test('red team: gpg check is per command, not satisfied by another command in the chain', () => {
+  const signing = opts({ gpgsign: () => 'true' });
+  assert.strictEqual(checkPre(bash('git -c commit.gpgsign=false log; git commit -m x'), signing).length, 1);
+  assert.deepStrictEqual(checkPre(bash('git -c commit.gpgsign=false commit -m x && git push'), signing), []);
+});
+
+test('red team: ".." traversal into a read-only dir is blocked', () => {
+  const cfg = opts({ config: { readonly: ['vendor/'] } });
+  for (const p of ['/repo/src/../vendor/file.py', '/repo/./vendor/x.py', 'src/../vendor/a.py',
+    '/repo/a/b/../../vendor/c.py', 'C:\\repo\\src\\..\\vendor\\x.py']) {
+    const winRoot = p.startsWith('C:') ? opts({ env: { CLAUDE_PROJECT_DIR: 'C:\\repo' }, config: { readonly: ['vendor/'] } }) : cfg;
+    assert.strictEqual(checkPre(write(p, 'x'), winRoot).length, 1, p);
+  }
+  assert.deepStrictEqual(checkPre(write('/repo/vendor/../src/a.py', 'x'), cfg), []);
+});
+
+test('red team: a symlink/junction pointing into a read-only dir is blocked', (t) => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'guard-ln-')));
+  fs.mkdirSync(path.join(root, 'vendor'));
+  fs.mkdirSync(path.join(root, 'src'));
+  try {
+    fs.symlinkSync(path.join(root, 'vendor'), path.join(root, 'src', 'alias'), 'junction');
+  } catch (e) {
+    t.skip(`cannot create links here: ${e.code}`);
+    return;
+  }
+  const cfg = opts({ env: { CLAUDE_PROJECT_DIR: root }, config: { readonly: ['vendor/'] } });
+  assert.strictEqual(checkPre(write(path.join(root, 'src', 'alias', 'new.py'), 'x'), cfg).length, 1);
+  assert.strictEqual(checkPre(write(path.join(root, 'src', 'alias', 'deep', 'new.py'), 'x'), cfg).length, 1);
+  assert.deepStrictEqual(checkPre(write(path.join(root, 'src', 'real.py'), 'x'), cfg), []);
+});
+
+test('red team: the agent cannot edit the guard, its config or hook settings', () => {
+  for (const p of ['/repo/.claude/guardrails.json', '/repo/.claude/settings.json',
+    '/repo/.claude/settings.local.json', '.claude/../.claude/guardrails.json', GUARD_ABS]) {
+    assert.match(checkPre(write(p, '{}'), opts())[0] || '', /^\(guard-config\)/, p);
+  }
+  assert.deepStrictEqual(checkPre(write('/repo/.claude/agents/x.md', 'x'), opts()), []);
+  assert.deepStrictEqual(checkPre(write('/repo/sub/.claude/guardrails.json', '{}'), opts()), []);
+});
+
+test('red team: the secret check also covers Edit and MultiEdit text', () => {
+  const key = 'ghp_' + 'b'.repeat(36);
+  const edit = { tool_name: 'Edit', tool_input: { file_path: 'a.js', old_string: 'x', new_string: `t="${key}"` } };
+  const multi = { tool_name: 'MultiEdit', tool_input: { file_path: 'a.js', edits: [{ new_string: 'ok' }, { new_string: key }] } };
+  assert.match(checkPre(edit, opts())[0], /GitHub PAT/);
+  assert.match(checkPre(multi, opts())[0], /GitHub PAT/);
 });
