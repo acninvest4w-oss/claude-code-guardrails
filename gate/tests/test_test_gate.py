@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -154,3 +155,40 @@ def test_parse_fixer_garbage_is_fatal():
 def test_deny_rules_cover_dir_and_file():
     rules = gate.deny_rules(["tests", "conftest.py"])
     assert "Edit(./tests/**)" in rules and "Write(./conftest.py)" in rules
+
+
+def test_hung_test_command_is_killed_with_its_children(project, monkeypatch):
+    # The shell starts python, which starts a grandchild that holds the pipes open:
+    # a plain subprocess.run(timeout=) would block on it forever.
+    hang = ("import subprocess, sys, time; "
+            "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)']); "
+            "time.sleep(120)")
+    calls = []
+    monkeypatch.setattr(gate, "call_fixer", fake_fixer(lambda cwd, p: calls.append(1)))
+    cfg = make_cfg(project, test=f'"{sys.executable}" -c "{hang}"', test_timeout=2)
+    started = time.monotonic()
+    assert gate.gate_loop(cfg) == gate.EXIT_TIMEOUT
+    assert time.monotonic() - started < 30
+    assert calls == []
+
+
+def test_fixer_timeout_aborts_as_failed_call(project, monkeypatch):
+    monkeypatch.setattr(gate, "run_proc", lambda *a, **k: gate.ProcResult(None, b"", b""))
+    res = gate.call_fixer("prompt", make_cfg(project, fixer_timeout=5))
+    assert res.failed and "timed out" in res.text
+
+
+def test_max_cost_stops_between_rounds(project, monkeypatch):
+    calls = []
+    def spend(prompt, cfg):
+        calls.append(1)
+        return gate.FixerResult(False, "summary", 0.6)
+    monkeypatch.setattr(gate, "call_fixer", spend)
+    assert gate.gate_loop(make_cfg(project, rounds=5, max_cost=1.0)) == gate.EXIT_BUDGET
+    assert len(calls) == 2
+
+
+def test_check_mode_reports_timeout(project):
+    cfg = make_cfg(project, test=f'"{sys.executable}" -c "import time; time.sleep(60)"',
+                   test_timeout=1)
+    assert gate.run_check(cfg) == gate.EXIT_TIMEOUT

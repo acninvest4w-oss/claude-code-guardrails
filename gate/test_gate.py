@@ -14,13 +14,17 @@ Exit codes: 0 pass | 1 still red after all rounds (call a human)
             6 fixer call failed (auth/API error), no point retrying
             7 bad setup: test command broken (exit not in --red-codes, e.g.
               pytest 4 = path not found, 5 = no tests) or --protect matched no file
+            8 test command timed out (--test-timeout), process tree killed
+            9 --max-cost budget reached before the tests went green
 """
 from __future__ import annotations
 
 import argparse
 import hashlib
 import json
+import os
 import re
+import signal
 import shutil
 import subprocess
 import sys
@@ -35,6 +39,8 @@ EXIT_NOT_RED = 4
 EXIT_NO_CLAUDE = 5
 EXIT_FIXER_FAILED = 6
 EXIT_BAD_SETUP = 7
+EXIT_TIMEOUT = 8
+EXIT_BUDGET = 9
 
 FIXER_TOOLS = "Read,Edit,Write,Grep,Glob"
 IGNORED_PARTS = {"__pycache__", ".pytest_cache", "bin", "obj", "node_modules"}
@@ -45,8 +51,15 @@ HASH_CHUNK = 1 << 20
 
 @dataclass
 class TestRun:
-    code: int
+    code: int | None  # None = timed out
     output: str
+
+
+@dataclass
+class ProcResult:
+    code: int | None  # None = timed out, tree killed
+    stdout: bytes
+    stderr: bytes
 
 
 @dataclass
@@ -56,11 +69,39 @@ class FixerResult:
     cost: float
 
 
-def run_tests(cmd: str, cwd: Path) -> TestRun:
+def kill_tree(proc: subprocess.Popen) -> None:
+    """Kill the process and everything it spawned (a shell's pytest, a CLI's node)."""
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        os.killpg(proc.pid, signal.SIGKILL)
+
+
+def run_proc(cmd: str | list[str], cwd: Path, timeout: float, **kw: object) -> ProcResult:
+    """Popen + communicate with a timeout that kills the whole tree, not just the shell.
+
+    subprocess.run(timeout=) kills only the direct child; a grandchild holding the
+    pipes open would keep communicate() blocked forever.
+    """
+    stdin = kw.pop("stdin_data", None)
+    group = {} if os.name == "nt" else {"start_new_session": True}
+    proc = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, **group,
+                            stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
+                            stderr=kw.pop("stderr", subprocess.PIPE), **kw)
+    try:
+        out, err = proc.communicate(stdin, timeout=timeout)
+        return ProcResult(proc.returncode, out or b"", err or b"")
+    except subprocess.TimeoutExpired:
+        kill_tree(proc)
+        out, err = proc.communicate()
+        return ProcResult(None, out or b"", err or b"")
+
+
+def run_tests(cmd: str, cwd: Path, timeout: float) -> TestRun:
     """Run the test command through the shell, stdout and stderr interleaved."""
-    proc = subprocess.run(cmd, shell=True, cwd=cwd, stdout=subprocess.PIPE,
-                          stderr=subprocess.STDOUT)
-    return TestRun(proc.returncode, proc.stdout.decode("utf-8", errors="replace"))
+    res = run_proc(cmd, cwd, timeout, shell=True, stderr=subprocess.STDOUT)
+    return TestRun(res.code, res.stdout.decode("utf-8", errors="replace"))
 
 
 def iter_protected(paths: list[str], cwd: Path) -> list[Path]:
@@ -174,10 +215,11 @@ def call_fixer(prompt: str, cfg: argparse.Namespace) -> FixerResult:
            "--disallowedTools", deny_rules(cfg.protect), "--max-turns", str(cfg.max_turns)]
     if cfg.model:
         cmd += ["--model", cfg.model]
-    proc = subprocess.run(cmd, input=prompt.encode("utf-8"), cwd=cfg.cwd,
-                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    return parse_fixer(proc.stdout.decode("utf-8", errors="replace"),
-                       proc.stderr.decode("utf-8", errors="replace"))
+    res = run_proc(cmd, cfg.cwd, cfg.fixer_timeout, stdin_data=prompt.encode("utf-8"))
+    if res.code is None:
+        return FixerResult(True, f"fixer timed out after {cfg.fixer_timeout:g}s, killed", 0.0)
+    return parse_fixer(res.stdout.decode("utf-8", errors="replace"),
+                       res.stderr.decode("utf-8", errors="replace"))
 
 
 def save_log(cfg: argparse.Namespace, name: str, text: str) -> None:
@@ -189,12 +231,11 @@ def gate_loop(cfg: argparse.Namespace) -> int:
     """Test -> fix -> test until green, tampered, or out of rounds."""
     before = snapshot(cfg.protect, cfg.cwd, cfg.log_dir / "protected")
     for rnd in range(cfg.rounds + 1):
-        run = run_tests(cfg.test, cfg.cwd)
+        run = run_tests(cfg.test, cfg.cwd, cfg.test_timeout)
         save_log(cfg, f"test_{rnd}.log", run.output)
-        if run.code == 0:
-            return report_green(cfg, rnd)
-        if run.code not in cfg.red_codes:
-            return report_bad_command(cfg, run.code, f"test_{rnd}.log")
+        stop = judge_run(cfg, run, f"test_{rnd}.log", rnd)
+        if stop is not None:
+            return stop
         if rnd == cfg.rounds:
             break
         stop = fix_round(cfg, run, rnd + 1, before)
@@ -203,6 +244,24 @@ def gate_loop(cfg: argparse.Namespace) -> int:
     print(f"[gate] STILL RED after {cfg.rounds} rounds -> human needed. "
           f"Cost ${cfg.cost:.2f}. Logs: {cfg.log_dir}")
     return EXIT_STILL_RED
+
+
+def judge_run(cfg: argparse.Namespace, run: TestRun, log_name: str, rnd: int) -> int | None:
+    """Green, timed out or a broken command ends the loop; a real red test goes on."""
+    if run.code is None:
+        print(f"[gate] ABORT: test command timed out after {cfg.test_timeout:g}s, "
+              f"process tree killed. Log: {cfg.log_dir / log_name}")
+        return EXIT_TIMEOUT
+    if run.code == 0:
+        return report_green(cfg, rnd)
+    if run.code not in cfg.red_codes:
+        return report_bad_command(cfg, run.code, log_name)
+    return None
+
+
+def over_budget(cfg: argparse.Namespace) -> bool:
+    """Checked between rounds, so one round may overshoot the cap."""
+    return cfg.max_cost > 0 and cfg.cost >= cfg.max_cost
 
 
 def fix_round(cfg: argparse.Namespace, run: TestRun, rnd: int,
@@ -217,9 +276,13 @@ def fix_round(cfg: argparse.Namespace, run: TestRun, rnd: int,
     if tampered:
         return report_tampered(before, tampered, cfg)
     if res.failed:
-        print(f"[gate] ABORT: fixer call failed (auth/API error?), see fixer_{rnd}.txt "
-              f"in {cfg.log_dir}")
+        print(f"[gate] ABORT: fixer call failed (auth/API error or timeout), "
+              f"see fixer_{rnd}.txt in {cfg.log_dir}")
         return EXIT_FIXER_FAILED
+    if over_budget(cfg):
+        print(f"[gate] STOP: spent ${cfg.cost:.2f} >= --max-cost ${cfg.max_cost:.2f}. "
+              f"Logs: {cfg.log_dir}")
+        return EXIT_BUDGET
     return None
 
 
@@ -254,8 +317,11 @@ def report_tampered(before: Snapshot, tampered: list[Path],
 
 def run_check(cfg: argparse.Namespace) -> int:
     """Single run, no fixer: report the test exit code as the verdict."""
-    run = run_tests(cfg.test, cfg.cwd)
+    run = run_tests(cfg.test, cfg.cwd, cfg.test_timeout)
     save_log(cfg, "check.log", run.output)
+    if run.code is None:
+        print(f"[gate] TIMEOUT after {cfg.test_timeout:g}s. Log: {cfg.log_dir / 'check.log'}")
+        return EXIT_TIMEOUT
     verdict = "PASS" if run.code == 0 else "FAIL"
     print(f"[gate] {verdict}: test exit {run.code}. Log: {cfg.log_dir / 'check.log'}")
     return EXIT_PASS if run.code == 0 else EXIT_STILL_RED
@@ -276,6 +342,12 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
                     help="exit codes that mean 'tests failed' (pytest/dotnet: 1); others abort")
     ap.add_argument("--expect-red", action="store_true", help="fail if tests start green")
     ap.add_argument("--check", action="store_true", help="run tests once, no fixer")
+    ap.add_argument("--test-timeout", type=float, default=1800,
+                    help="seconds per test run before the process tree is killed")
+    ap.add_argument("--fixer-timeout", type=float, default=1800,
+                    help="seconds per fixer call before it is killed")
+    ap.add_argument("--max-cost", type=float, default=0.0,
+                    help="stop once fixer spend reaches this many USD (0 = no cap)")
     ap.add_argument("--cwd", default=".")
     cfg = ap.parse_args(argv)
     cfg.cwd = Path(cfg.cwd).resolve()
