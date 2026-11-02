@@ -192,6 +192,27 @@ test('red team: a symlink/junction pointing into a read-only dir is blocked', (t
   assert.deepStrictEqual(checkPre(write(path.join(root, 'src', 'real.py'), 'x'), cfg), []);
 });
 
+// alias -> vendor/sub: "alias/../t.js" is <root>/t.js lexically but <root>/vendor/t.js
+// to a POSIX kernel, which follows the link before applying "..". Both must be checked.
+test('red team: a link followed by ".." cannot climb out of the check', (t) => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'guard-ln-')));
+  fs.mkdirSync(path.join(root, 'vendor', 'sub'), { recursive: true });
+  try {
+    fs.symlinkSync(path.join(root, 'vendor', 'sub'), path.join(root, 'alias'), 'junction');
+  } catch (e) {
+    t.skip(`cannot create links here: ${e.code}`);
+    return;
+  }
+  const cfg = opts({ env: { CLAUDE_PROJECT_DIR: root }, config: { readonly: ['vendor/'] } });
+  // built by hand: path.join would collapse the ".." before the guard sees it
+  for (const p of [`${root}/alias/../target.js`, 'alias/../target.js', `${root}${path.sep}alias${path.sep}..${path.sep}x/y.js`]) {
+    assert.strictEqual(checkPre(write(p, 'x'), cfg).length, 1, p);
+  }
+  // physically vendor/sub -> vendor -> <root>: lands outside vendor/ either way
+  assert.deepStrictEqual(checkPre(write(`${root}/alias/../../out.js`, 'x'), cfg), []);
+  assert.deepStrictEqual(checkPre(write(`${root}/src/../target.js`, 'x'), cfg), []);
+});
+
 test('red team: the agent cannot edit the guard, its config or hook settings', () => {
   for (const p of ['/repo/.claude/guardrails.json', '/repo/.claude/settings.json',
     '/repo/.claude/settings.local.json', '.claude/../.claude/guardrails.json', GUARD_ABS]) {
@@ -199,6 +220,32 @@ test('red team: the agent cannot edit the guard, its config or hook settings', (
   }
   assert.deepStrictEqual(checkPre(write('/repo/.claude/agents/x.md', 'x'), opts()), []);
   assert.deepStrictEqual(checkPre(write('/repo/sub/.claude/guardrails.json', '{}'), opts()), []);
+});
+
+test('red team: shell writes into read-only dirs or guard files are blocked too', () => {
+  const cfg = opts({ config: { readonly: ['vendor/'] } });
+  for (const cmd of [
+    'echo x > vendor/a.py', 'echo x >>vendor/a.py', 'cat a 2> vendor/log', 'ls && echo x>"vendor/q.py"',
+    'echo x | tee -a vendor/a.py', "sed -i 's/a/b/' vendor/a.py", 'sed -i.bak -e s/a/b/ vendor/a.py',
+    'cp src/a.py vendor/', 'mv a.py ./vendor/b.py', 'rm -rf vendor', 'rm -rf vendor/sub', 'touch vendor/x',
+    'dd if=a of=vendor/b', 'FOO=1 sudo /bin/cp a vendor/b', 'echo x > src/../vendor/a.py',
+  ]) assert.match(checkPre(bash(cmd), cfg)[0] || '', /^\(readonly-dir\)/, cmd);
+  for (const cmd of [
+    'cat vendor/a.py > out.txt', 'cp vendor/a.py src/', 'grep -r x vendor 2>/dev/null', 'sed s/a/b/ vendor/a.py',
+    'ls vendor 2>&1 | head', 'echo "a > b"', 'rm -rf build',
+  ]) assert.deepStrictEqual(checkPre(bash(cmd), cfg), [], cmd);
+  for (const cmd of ['echo {} > .claude/guardrails.json', "sed -i 's/x//' .claude/settings.json",
+    `cp /tmp/x ${GUARD_ABS}`]) {
+    assert.match(checkPre(bash(cmd), opts())[0] || '', /^\(guard-config\)/, cmd);
+  }
+});
+
+test('red team: a secret written through the shell is blocked, a .env target or no write is not', () => {
+  const key = 'sk-ant-' + 'z'.repeat(30);
+  assert.match(checkPre(bash(`echo KEY=${key} > config.py`), opts())[0] || '', /^\(secret\)/);
+  assert.match(checkPre(bash(`printf "${key}" | tee app.js`), opts())[0] || '', /^\(secret\)/);
+  assert.deepStrictEqual(checkPre(bash(`echo KEY=${key} >> .env`), opts()), []);
+  assert.deepStrictEqual(checkPre(bash('echo ok > out.txt'), opts()), []);
 });
 
 test('red team: the secret check also covers Edit and MultiEdit text', () => {

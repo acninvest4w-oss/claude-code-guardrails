@@ -13,7 +13,9 @@
 //         `export` inside the agent's Bash tool does not reach this process.
 //
 // Scope: this is a seatbelt against agent mistakes, not a sandbox. It sees Edit/Write/
-// MultiEdit and the Bash command string; a shell redirect (echo > file) is not parsed.
+// MultiEdit and the Bash command string, where it finds write targets of redirects,
+// tee, sed -i, cp/mv/ln/install, rm/touch/truncate and dd. A script the agent writes
+// and then runs, python -c, variables or eval are not followed.
 // Hard boundaries belong in permissions.deny and Claude Code's sandbox.
 const fs = require('fs');
 const nodePath = require('path');
@@ -80,31 +82,60 @@ function realExisting(p) {
   }
 }
 
-// Absolute, real path as segments: "..", "." and links resolved;
-// Windows drive paths compare case-insensitively.
-function fullSegments(p, root) {
-  const joined = isAbs(p) ? p : `${root || ''}/${p}`;
-  const local = nodePath.isAbsolute(joined) ? realExisting(nodePath.normalize(joined)) : joined;
+function realOrSelf(p) {
+  try {
+    return fs.realpathSync.native(p);
+  } catch (e) {
+    return p; // missing or unreadable: keep the lexical path
+  }
+}
+
+// Path as segments, "." and ".." collapsed; Windows drive paths compare case-insensitively.
+function toSegments(p) {
   const segs = [];
-  for (const s of local.replace(/\\/g, '/').split('/')) {
+  for (const s of p.replace(/\\/g, '/').split('/')) {
     if (s === '..') segs.pop();
     else if (s && s !== '.') segs.push(s);
   }
   return /^[a-zA-Z]:$/.test(segs[0] || '') ? segs.map((s) => s.toLowerCase()) : segs;
 }
 
+const joinRoot = (p, root) => (isAbs(p) ? p : `${root || ''}/${p}`);
+
+// Lexical: ".." collapsed first, then links resolved (Windows, path.resolve).
+function lexicalSegments(p, root) {
+  const joined = joinRoot(p, root);
+  return toSegments(nodePath.isAbsolute(joined) ? realExisting(nodePath.normalize(joined)) : joined);
+}
+
+// Physical: each link is resolved before a later ".." applies to it (POSIX kernel):
+// with alias -> vendor/sub, "alias/../x" is vendor/x, not <root>/x.
+function physicalSegments(p, root) {
+  const joined = joinRoot(p, root);
+  if (!nodePath.isAbsolute(joined)) return toSegments(joined);
+  const top = nodePath.parse(joined).root;
+  let cur = top;
+  for (const s of joined.slice(top.length).split(/[\\/]/)) {
+    if (s === '..') cur = nodePath.dirname(cur);
+    else if (s && s !== '.') cur = realOrSelf(nodePath.join(cur, s));
+  }
+  return toSegments(cur);
+}
+
+// Where a write to `p` may land; the OS decides which, so rules check both.
+const landings = (p, root) => [lexicalSegments(p, root), physicalSegments(p, root)];
+
 // True when `file` is inside read-only `dir`. A relative `dir` is anchored at the
 // project root, so "lib/" matches <root>/lib/x.js but not <root>/src/lib/x.js or mylib/.
 function underDir(file, dir, root) {
-  const d = fullSegments(dir, root);
-  const f = fullSegments(file, root);
-  return d.length > 0 && d.length < f.length && d.every((s, i) => s === f[i]);
+  const d = lexicalSegments(dir, root);
+  return d.length > 0 && landings(file, root).some((f) =>
+    d.length < f.length && d.every((s, i) => s === f[i]));
 }
 
 function samePath(a, b, root) {
-  const x = fullSegments(a, root);
-  const y = fullSegments(b, root);
-  return x.length === y.length && x.every((s, i) => s === y[i]);
+  const y = lexicalSegments(b, root);
+  return landings(a, root).some((x) => x.length === y.length && x.every((s, i) => s === y[i]));
 }
 
 // Files that switch the guard itself off; the agent may not edit them.
@@ -114,11 +145,38 @@ const GUARD_FILES = ['.claude/guardrails.json', '.claude/settings.json',
 // One shell command split into the commands it chains: ; && || | & and newlines.
 const subCommands = (cmd) => cmd.split(/&&|\|\||[;|&\n]/).map((s) => s.trim()).filter(Boolean);
 
+const unquote = (a) => a.replace(/^["'(`]+|["')`]+$/g, '');
+const REDIRECT = /(?:^|[^<>])\d?>>?\s*([^\s;&|<>()]+)/g;
+const ENV_FILE = /(^|[\\/])\.env(\.[\w-]+)?$/;
+
+// Files a simple command writes or removes, by command name (best effort, no quoting rules).
+function commandTargets(words) {
+  const i = words.findIndex((w) => w && !/^\w+=/.test(w) && w !== 'sudo');
+  const [name = '', ...args] = i < 0 ? [] : words.slice(i);
+  const files = args.filter((a) => a && !a.startsWith('-'));
+  const base = nodePath.basename(name).replace(/\.exe$/i, '');
+  if (['tee', 'rm', 'rmdir', 'touch', 'truncate'].includes(base)) return files;
+  if (base === 'sed' && args.some((a) => /^(-[a-zA-Z]*i|--in-place)/.test(a))) return files;
+  if (['cp', 'mv', 'install', 'ln'].includes(base)) return files.slice(-1);
+  if (base === 'dd') return args.filter((a) => a.startsWith('of=')).map((a) => a.slice(3));
+  return [];
+}
+
+// Paths a Bash command line writes to: redirects plus the commands above, per chained command.
+function writeTargets(cmd) {
+  return subCommands(cmd).flatMap((seg) => {
+    const redirects = [...seg.matchAll(REDIRECT)].map((m) => m[1]);
+    const words = seg.replace(REDIRECT, ' ').trim().split(/\s+/).map(unquote);
+    return redirects.concat(commandTargets(words)).map(unquote)
+      .filter((t) => t && !t.startsWith('/dev/'));
+  });
+}
+
 // `git [-C dir] [-c k=v] add <args>` with -A/--all/./*/:/ and no --dry-run/-n.
 function addsEverything(seg) {
   const m = seg.match(/(?:^|[\s(`])git((?:\s+(?:-[cC]\s+\S+|--[\w-]+(?:=\S+)?))*)\s+add\b(.*)$/);
   if (!m) return false;
-  const args = m[2].trim().split(/\s+/).map((a) => a.replace(/^["'(]+|["')`]+$/g, ''));
+  const args = m[2].trim().split(/\s+/).map(unquote);
   if (args.some((a) => a === '--dry-run' || a === '-n' || /^-[a-zA-Z]*n[a-zA-Z]*$/.test(a))) return false;
   return args.some((a) => ['--all', '.', './', '*', ':/', ':'].includes(a) || /^-[a-zA-Z]*A[a-zA-Z]*$/.test(a));
 }
@@ -137,18 +195,20 @@ const BLOCK_RULES = [
       && c.gpgsign() === 'true'
       && 'commit.gpgsign=true: the pinentry prompt hangs a non-interactive agent shell. '
         + 'Use git -c commit.gpgsign=false commit ..., or ask the user to commit.' },
-  { id: 'guard-config', tool: 'edit',
-    check: (c) => GUARD_FILES.some((g) => samePath(c.path, g, c.root))
+  { id: 'guard-config', tool: ['edit', 'Bash'],
+    check: (c) => c.targets.some((t) => GUARD_FILES.some((g) => samePath(t, g, c.root)))
       && 'guardrail config and hook settings are edited by the user, not the agent. '
         + 'Say what should change and why.' },
-  { id: 'readonly-dir', tool: 'edit',
+  { id: 'readonly-dir', tool: ['edit', 'Bash'],
     check: (c) => {
-      const hit = c.readonly.find((d) => underDir(c.path, d, c.root));
+      // the dir itself counts too: rm -rf vendor, cp x vendor/
+      const hit = c.readonly.find((d) => c.targets.some((t) =>
+        underDir(t, d, c.root) || samePath(t, d, c.root)));
       return hit && `${hit} is read-only (config "readonly"). Copy the pattern elsewhere.`;
     } },
-  { id: 'secret', tool: 'edit',
+  { id: 'secret', tool: ['edit', 'Bash'],
     check: (c) => {
-      if (/(^|[\\/])\.env(\.[\w-]+)?$/.test(c.path)) return null;
+      if (c.targets.every((t) => ENV_FILE.test(t))) return null; // no target = nothing written
       const hits = SECRET_PATTERNS.filter(([, re]) => re.test(c.text)).map(([n]) => n);
       return hits.length > 0 && `hardcoded secret (${hits.join(', ')}): not written. `
         + 'Read it from an env var / .env instead.';
@@ -192,8 +252,11 @@ function buildContext(input, env, gpgsign, config) {
   const fromEnv = (env.GUARDRAILS_READONLY || '').split(',');
   const readonly = fromEnv.concat(config.readonly || []).map((s) => s.trim()).filter(Boolean);
   const isEdit = EDIT_TOOLS.includes(input.tool_name);
-  return { tool: isEdit ? 'edit' : input.tool_name, cmd: ti.command || '',
-    path: ti.file_path || '', text: isEdit ? newText(ti) : '', root, readonly, gpgsign };
+  const cmd = ti.command || '';
+  const path = ti.file_path || '';
+  const targets = isEdit ? [path] : (input.tool_name === 'Bash' ? writeTargets(cmd) : []);
+  return { tool: isEdit ? 'edit' : input.tool_name, cmd, path, targets,
+    text: isEdit ? newText(ti) : cmd, root, readonly, gpgsign };
 }
 
 function applyRules(rules, input, opts = {}) {
@@ -202,7 +265,8 @@ function applyRules(rules, input, opts = {}) {
   const c = buildContext(input, env, opts.gpgsign || readGpgsign, config);
   const off = new Set(config.disable || []);
   return rules
-    .filter((r) => !off.has(r.id) && r.tool === c.tool && (!r.file || r.file.test(c.path)))
+    .filter((r) => !off.has(r.id) && [].concat(r.tool).includes(c.tool)
+      && (!r.file || r.file.test(c.path)))
     .map((r) => [r.id, r.check(c)])
     .filter(([, msg]) => msg)
     .map(([id, msg]) => `(${id}) ${msg}`);
