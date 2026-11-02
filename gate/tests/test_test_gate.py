@@ -23,7 +23,7 @@ def project(tmp_path: Path) -> Path:
 
 
 def make_cfg(project: Path, **over: object) -> object:
-    cmd = f'"{sys.executable}" -m pytest -q -p no:cacheprovider --rootdir . tests'
+    cmd = f'"{sys.executable}" -B -m pytest -q -p no:cacheprovider --rootdir . tests'
     argv = ["--test", cmd, "--cwd", str(project), "--rounds", "2"]
     cfg = gate.parse_args(argv)
     cfg.claude = "claude"
@@ -109,7 +109,7 @@ def test_broken_test_command_aborts_without_fixer(project, monkeypatch):
     calls = []
     monkeypatch.setattr(gate, "call_fixer", fake_fixer(lambda cwd, p: calls.append(1)))
     cfg = make_cfg(project)
-    cfg.test = f'"{sys.executable}" -m pytest -q -p no:cacheprovider no_such_dir'
+    cfg.test = f'"{sys.executable}" -B -m pytest -q -p no:cacheprovider no_such_dir'
     assert gate.gate_loop(cfg) == gate.EXIT_BAD_SETUP
     assert calls == []
 
