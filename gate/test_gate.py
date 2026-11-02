@@ -18,6 +18,7 @@ Exit codes: 0 pass | 1 still red after all rounds (call a human)
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import shutil
@@ -39,6 +40,7 @@ FIXER_TOOLS = "Read,Edit,Write,Grep,Glob"
 IGNORED_PARTS = {"__pycache__", ".pytest_cache", "bin", "obj", "node_modules"}
 FAIL_MARKERS = re.compile(r"FAILED|ERROR|Error:|AssertionError|assert |Traceback")
 EARLY_FAIL_LINES = 20
+HASH_CHUNK = 1 << 20
 
 
 @dataclass
@@ -74,25 +76,51 @@ def iter_protected(paths: list[str], cwd: Path) -> list[Path]:
     return sorted(set(files))
 
 
-def snapshot(paths: list[str], cwd: Path) -> dict[Path, bytes]:
-    """Read every protected file so tampering can be detected and undone."""
-    return {f: f.read_bytes() for f in iter_protected(paths, cwd)}
+@dataclass
+class Snapshot:
+    """sha256 per protected file in memory; the original bytes live on disk."""
+    hashes: dict[Path, str]
+    backups: dict[Path, Path]
 
 
-def find_tampered(before: dict[Path, bytes], paths: list[str], cwd: Path) -> list[Path]:
+def file_hash(path: Path) -> str:
+    """Stream the file through sha256 so large fixtures never sit in RAM."""
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(HASH_CHUNK), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def hash_files(paths: list[str], cwd: Path) -> dict[Path, str]:
+    """Current sha256 of every protected file."""
+    return {f: file_hash(f) for f in iter_protected(paths, cwd)}
+
+
+def snapshot(paths: list[str], cwd: Path, backup_dir: Path) -> Snapshot:
+    """Hash every protected file and copy it to backup_dir for a later restore."""
+    hashes = hash_files(paths, cwd)
+    backups: dict[Path, Path] = {}
+    for idx, f in enumerate(hashes):
+        backups[f] = backup_dir / f"{idx}_{f.name}"
+        shutil.copy2(f, backups[f])
+    return Snapshot(hashes, backups)
+
+
+def find_tampered(before: Snapshot, paths: list[str], cwd: Path) -> list[Path]:
     """Return protected files that were changed, added or deleted since the snapshot."""
-    after = snapshot(paths, cwd)
-    changed = [f for f in before if after.get(f) != before[f]]
-    added = [f for f in after if f not in before]
+    after = hash_files(paths, cwd)
+    changed = [f for f in before.hashes if after.get(f) != before.hashes[f]]
+    added = [f for f in after if f not in before.hashes]
     return sorted(changed + added)
 
 
-def restore(before: dict[Path, bytes], tampered: list[Path]) -> None:
+def restore(before: Snapshot, tampered: list[Path]) -> None:
     """Put protected files back exactly as snapshotted; remove added ones."""
     for f in tampered:
-        if f in before:
+        if f in before.backups:
             f.parent.mkdir(parents=True, exist_ok=True)
-            f.write_bytes(before[f])
+            shutil.copy2(before.backups[f], f)
         else:
             f.unlink(missing_ok=True)
 
@@ -159,7 +187,7 @@ def save_log(cfg: argparse.Namespace, name: str, text: str) -> None:
 
 def gate_loop(cfg: argparse.Namespace) -> int:
     """Test -> fix -> test until green, tampered, or out of rounds."""
-    before = snapshot(cfg.protect, cfg.cwd)
+    before = snapshot(cfg.protect, cfg.cwd, cfg.log_dir / "protected")
     for rnd in range(cfg.rounds + 1):
         run = run_tests(cfg.test, cfg.cwd)
         save_log(cfg, f"test_{rnd}.log", run.output)
@@ -178,7 +206,7 @@ def gate_loop(cfg: argparse.Namespace) -> int:
 
 
 def fix_round(cfg: argparse.Namespace, run: TestRun, rnd: int,
-              before: dict[Path, bytes]) -> int | None:
+              before: Snapshot) -> int | None:
     """One fixer call; returns an exit code to stop on, or None to keep looping."""
     print(f"[gate] round {rnd}/{cfg.rounds}: tests red (exit {run.code}) -> fixer")
     prompt = build_prompt(cfg.task, summarize_log(run.output, cfg.tail), cfg.protect)
@@ -214,7 +242,7 @@ def report_bad_command(cfg: argparse.Namespace, code: int, log_name: str) -> int
     return EXIT_BAD_SETUP
 
 
-def report_tampered(before: dict[Path, bytes], tampered: list[Path],
+def report_tampered(before: Snapshot, tampered: list[Path],
                     cfg: argparse.Namespace) -> int:
     """Undo edits to protected files and abort; the fix cannot be trusted."""
     restore(before, tampered)
@@ -254,6 +282,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     cfg.red_codes = {int(c) for c in cfg.red_codes.split(",")}
     cfg.claude = shutil.which("claude")
     cfg.log_dir = Path(tempfile.mkdtemp(prefix="test_gate_"))
+    (cfg.log_dir / "protected").mkdir()
     cfg.cost = 0.0
     return cfg
 

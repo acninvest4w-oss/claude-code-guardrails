@@ -78,11 +78,24 @@ def test_expect_red_rejects_tests_already_green(project, monkeypatch):
     assert gate.gate_loop(make_cfg(project, expect_red=True)) == gate.EXIT_NOT_RED
 
 
-def test_cache_dirs_are_not_tampering(project):
-    before = gate.snapshot(["tests"], project)
+def test_cache_dirs_are_not_tampering(project, tmp_path_factory):
+    before = gate.snapshot(["tests"], project, tmp_path_factory.mktemp("bak"))
     (project / "tests" / "__pycache__").mkdir()
     (project / "tests" / "__pycache__" / "x.pyc").write_bytes(b"\0")
     assert gate.find_tampered(before, ["tests"], project) == []
+
+
+def test_binary_fixture_is_hashed_and_restored_from_disk(project, tmp_path_factory, monkeypatch):
+    blob = bytes(range(256)) * 4096  # 1 MiB binary fixture
+    (project / "tests" / "data.bin").write_bytes(blob)
+    before = gate.snapshot(["tests"], project, tmp_path_factory.mktemp("bak"))
+    assert all(isinstance(h, str) and len(h) == 64 for h in before.hashes.values())
+
+    def cheat(cwd, prompt):
+        (cwd / "tests" / "data.bin").write_bytes(b"short")
+    monkeypatch.setattr(gate, "call_fixer", fake_fixer(cheat))
+    assert gate.gate_loop(make_cfg(project)) == gate.EXIT_TAMPERED
+    assert (project / "tests" / "data.bin").read_bytes() == blob
 
 
 def test_check_mode_uses_exit_code(project):
