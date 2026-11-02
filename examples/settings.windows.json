@@ -1,0 +1,26 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "C:/path/to/pythonw.exe C:/path/to/repo/.claude/hooks/hide.py node C:/path/to/repo/.claude/hooks/guard.js"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "C:/path/to/pythonw.exe C:/path/to/repo/.claude/hooks/hide.py node C:/path/to/repo/.claude/hooks/guard.js"
+          }
+        ]
+      }
+    ]
+  }
+}
