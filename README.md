@@ -247,6 +247,71 @@ module-qualified cmdlets). A sweep of everyday commands (`rm -f *.log`,
 tool call. [`hooks/hide.py`](hooks/hide.py) runs it under `pythonw` with
 `CREATE_NO_WINDOW`; see [`examples/settings.windows.json`](examples/settings.windows.json).
 
+### Layers: permission rules and the sandbox hold the line, the hook explains
+
+The hook is a seatbelt. Where Claude Code can enforce a boundary itself, let it, and keep
+the hook for what rules cannot express and for the message that stops the model retrying.
+The example settings ship both layers:
+
+- **File boundaries -> `permissions.deny` `Edit(...)` rules.** An `Edit` deny covers every
+  built-in tool that edits files (Write and MultiEdit included; `Write(...)` path rules
+  never match), and Bash redirects / `tee` / `sed` that Claude Code recognises
+  ([permissions](https://code.claude.com/docs/en/permissions.md#read-and-edit)). In project
+  settings `/x` is the project root and `//c/x` an absolute path, also on Windows
+  ([anchoring](https://code.claude.com/docs/en/permissions.md#where-a-pattern-anchors)).
+  The examples deny `/.claude/settings*.json`, `/.claude/guardrails.json`,
+  `/.claude/hooks/**` and the example read-only `/vendor/**`; add `//c/tools/claude-code-guardrails/**`
+  (your clone) when the hook runs from a clone. Managed settings make a deny impossible
+  to override from any project.
+- **Shell writes -> the sandbox, where there is one.** It confines Bash and PowerShell
+  commands and their children at the OS level and refuses writes to `.claude` settings,
+  hooks and agents even inside writable directories
+  ([sandboxing](https://code.claude.com/docs/en/sandboxing.md#settings-file-protection)).
+  It runs on macOS, Linux and WSL2 only: **on native Windows commands run unsandboxed**,
+  so there the hook is the only check on what a shell command writes.
+- **Command rules (`Bash(...)`, `PowerShell(...)`) are tripwires, not boundaries.** They
+  match text, so `git -C . push` or `bash -c '...'` slip past them, by the docs' own
+  account ([what a Bash rule doesn't match](https://code.claude.com/docs/en/permissions.md#what-a-bash-rule-doesnt-match)).
+  The examples add none: `git add -A` stays with the hook, which reads chains, `cd`, `-C`
+  and pathspecs. If you add one on Windows with Git Bash, add the matching `PowerShell(...)`
+  rule too: **any Bash deny turns the PowerShell tool off for the session, silently**
+  ([tools reference](https://code.claude.com/docs/en/tools-reference.md#bash-deny-rules-also-turn-off-the-powershell-tool)).
+- **The hook** keeps everything above as a second check (it runs before permission rules,
+  [hooks](https://code.claude.com/docs/en/hooks.md#exit-code-output)) and adds what no rule
+  expresses: PowerShell cmdlet writes, `cd`/`Set-Location` tracking, links and `..`,
+  secrets in content, the per-language warnings, and the reason the model reads.
+
+### Measured on a real project
+
+Replayed offline with [`bench/replay.js`](bench/replay.js) against the transcripts of one
+active Windows monorepo (318 sessions): **8,917 tool calls** (3,777 Bash, 2,151 PowerShell,
+2,359 Edit, 630 Write). Every block was classified by hand; only counts are published.
+
+| | v1.1.1 | v1.2.0 |
+|---|---|---|
+| calls blocked | 78 | 39 |
+| false blocks | 41 (0.46%) | **2 (0.02%)** |
+| true blocks | 37 | 37 |
+
+The 39 false blocks fixed in v1.2.0 were all `git add -A <paths>`: with a pathspec `-A`
+stages only those paths, and it is allowed now. The 2 left: a token-shaped test fixture
+written to a scratch log (`secret`), and one long `cd a && ... && cd b && ... && cd ..`
+read-only chain whose possible directories passed the cap of 8 (`parse-error`). The 37 true
+blocks: non-ASCII in `logger.*()` in code that runs on a cp1252 Windows host (34), edits
+of `.claude/settings.json` (2), a bare `git add -A` (1). Warnings are advisory and were
+counted (for calls the hook let through), not classified: `broad-except-py` 156,
+`unicode-win-script` 42, `empty-catch-js` 6.
+
+Cost per hook call, measured with [`bench/latency.js`](bench/latency.js) on Windows 11
+(i7-14700F, Node 24), process start included:
+
+| command | p50 | p95 |
+|---|---|---|
+| `node guard.js` | 44-52 ms | 58-77 ms |
+| `pythonw hide.py node guard.js` (no console flash) | 80-89 ms | 91-128 ms |
+
+The check itself is 0.2 ms (p50) in process; the rest is starting the processes.
+
 ## 3. Reviewer: builder is not reviewer
 
 The agent that wrote the code is the worst one to review it. `reviewer.md` is a subagent
@@ -269,12 +334,20 @@ write failing test -> test_gate.py --expect-red -> green -> reviewer -> fix P1s 
 ## Development
 
 ```bash
-python -m pytest -q gate/tests        # real pytest subprocesses, fake fixer
-node --test hooks/tests/guard.test.js
+python -m pytest -q gate/tests e2e/test_smoke_checks.py   # real pytest subprocesses, fake fixer
+node --test hooks/tests/guard.test.js hooks/tests/fuzz.test.js bench/tests/replay.test.js
+FUZZ_RUNS=5000 node --test hooks/tests/fuzz.test.js   # longer; FUZZ_SEED=<n> replays a failure
 python e2e/smoke.py --model haiku     # real claude CLI, a few cents
+node bench/replay.js --root <project> ~/.claude/projects/<project-dir>   # your own false-block rate
+node bench/latency.js -- node hooks/guard.js                             # your own hook cost
 ```
 
-CI runs the unit tests on Ubuntu and Windows on every push. The end-to-end smoke test
+The fuzz suite generates commands for both shells from a seed and checks properties rather
+than cases: random text never crashes the guard; quoted text, comments, heredoc and
+here-string bodies never block; benign commands chained or wrapped around a protected write
+never hide it; every spelling of a protected path (quotes, escapes, `..`, `//`, case on
+Windows, `\`, `/c/`, `FileSystem::`) blocks; verdicts do not depend on earlier calls.
+CI runs the unit tests and the fuzz suite on Ubuntu and Windows on every push. The end-to-end smoke test
 ([`e2e/smoke.py`](e2e/smoke.py)) runs the real CLI: hooks wired into a throwaway project
 with Claude asked to break each rule (verdicts read from the filesystem and git index,
 not from the model's reply), then the gate fixing a real bug with the test file checked

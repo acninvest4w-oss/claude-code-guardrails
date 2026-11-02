@@ -1,4 +1,13 @@
 {
+  "permissions": {
+    "deny": [
+      "Edit(/.claude/settings.json)",
+      "Edit(/.claude/settings.local.json)",
+      "Edit(/.claude/guardrails.json)",
+      "Edit(/.claude/hooks/**)",
+      "Edit(/vendor/**)"
+    ]
+  },
   "hooks": {
     "PreToolUse": [
       {

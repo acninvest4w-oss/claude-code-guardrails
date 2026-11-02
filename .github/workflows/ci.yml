@@ -15,5 +15,5 @@ jobs:
         with:
           node-version: "22"
       - run: python -m pip install pytest
-      - run: python -m pytest -q gate/tests
-      - run: node --test hooks/tests/guard.test.js
+      - run: python -m pytest -q gate/tests e2e/test_smoke_checks.py
+      - run: node --test hooks/tests/guard.test.js hooks/tests/fuzz.test.js bench/tests/replay.test.js

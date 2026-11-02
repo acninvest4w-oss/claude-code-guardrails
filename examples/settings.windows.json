@@ -1,4 +1,13 @@
 {
+  "permissions": {
+    "deny": [
+      "Edit(/.claude/settings.json)",
+      "Edit(/.claude/settings.local.json)",
+      "Edit(/.claude/guardrails.json)",
+      "Edit(/vendor/**)",
+      "Edit(//c/tools/claude-code-guardrails/**)"
+    ]
+  },
   "hooks": {
     "PreToolUse": [
       {
@@ -6,7 +15,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "C:/path/to/pythonw.exe C:/path/to/repo/.claude/hooks/hide.py node C:/path/to/repo/.claude/hooks/guard.js"
+            "command": "C:/path/to/pythonw.exe C:/tools/claude-code-guardrails/hooks/hide.py node C:/tools/claude-code-guardrails/hooks/guard.js"
           }
         ]
       }
@@ -17,7 +26,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "C:/path/to/pythonw.exe C:/path/to/repo/.claude/hooks/hide.py node C:/path/to/repo/.claude/hooks/guard.js"
+            "command": "C:/path/to/pythonw.exe C:/tools/claude-code-guardrails/hooks/hide.py node C:/tools/claude-code-guardrails/hooks/guard.js"
           }
         ]
       }

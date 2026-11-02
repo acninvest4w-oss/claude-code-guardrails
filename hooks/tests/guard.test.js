@@ -28,6 +28,22 @@ test('git add -A / --all / . is blocked, --dry-run and named files pass', () => 
   }
 });
 
+// Field data (bench/replay.js): most git-add-all blocks were -A with named paths.
+test('git add -A with a pathspec stages only those paths and is allowed', () => {
+  for (const cmd of ['git add -A src/', 'git add -A tracker.py bot.py tests/test_x.py', 'git add --all docs',
+    'git add -A -- src/a.py', 'git -C sub add -A lib/', 'git add -A --chmod +x run.sh', 'git add -A --chmod=+x run.sh']) {
+    assert.deepStrictEqual(checkPre(bash(cmd), opts()), [], cmd);
+    assert.deepStrictEqual(checkPre({ tool_name: 'PowerShell', tool_input: { command: cmd } }, opts()), [], `ps ${cmd}`);
+  }
+  for (const cmd of ['git add -A', 'git add -A .', 'git add --all :/', 'git add -A src/ .', 'git add -A -- .',
+    'git add -A; git commit -m x src/a.py', 'git add -A --chmod +x', 'git add --chmod +x -A',
+    'git add -A --pathspec-from-file list.txt', 'git add -A --pathspec-from-file=list.txt',
+    "git add -A ':(top)'", "git add -A ':(glob)**'", "git add -A ':!secrets/'", "git add ':(top)'",
+    "git add -A '**'", 'git add -A ./*']) {
+    assert.strictEqual(checkPre(bash(cmd), opts()).length, 1, cmd);
+  }
+});
+
 test('git commit is blocked only when gpgsign=true and not overridden inline', () => {
   const signing = opts({ gpgsign: () => 'true' });
   assert.match(checkPre(bash('git commit -m x'), signing)[0], /^\(gpg-commit\)/);

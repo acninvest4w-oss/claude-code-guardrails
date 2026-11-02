@@ -928,15 +928,25 @@ function gitCall({ args: raw }) {
 
 const EVERYTHING = ['.', './', '*', ':/', ':', ':/*'];
 
-// git add -A/--all, or a pathspec like . * :/ .. , without -n/--dry-run before "--".
+// git add -A/--all with no pathspec, or a pathspec like . * :/ .. , without -n/--dry-run before "--".
 const addsEverything = (seg) => gitCalls(seg).some(addsAll);
+
+// git add options whose value is the next word (--chmod +x): that word is not a pathspec.
+// A --pathspec-from-file list cannot be read here, so it restricts nothing.
+const ADD_VALUE_OPTS = ['--chmod', '--pathspec-from-file'];
 
 function addsAll(git) {
   if (git.sub !== 'add') return false;
-  const { flags, operands } = splitArgs(git.args);
+  const dd = git.args.indexOf('--');
+  const isValue = (i) => i > 0 && (dd < 0 || i < dd) && ADD_VALUE_OPTS.includes(git.args[i - 1]);
+  const { flags, operands } = splitArgs(git.args.filter((_, i) => !isValue(i)));
   if (flags.some((a) => a === '--dry-run' || /^-[a-zA-Z]*n[a-zA-Z]*$/.test(a))) return false;
-  return flags.some((a) => a === '--all' || /^-[a-zA-Z]*A[a-zA-Z]*$/.test(a))
-    || operands.some((p) => EVERYTHING.includes(p) || /^(\.\.?[\\/]?)+$/.test(p));
+  // whole tree: . ./ * :/ .. and globs of only * . /; any magic pathspec (:(top), :(glob)**,
+  // :!x excludes) is read as the whole tree too, over-matching rather than missing
+  if (operands.some((p) => EVERYTHING.includes(p) || /^(\.\.?[\\/]?)+$/.test(p) || /^[*./\\]+$/.test(p)
+    || p.startsWith(':'))) return true;
+  // -A/--all works on the whole tree only without a pathspec; with one it stages just those paths
+  return !operands.length && flags.some((a) => a === '--all' || /^-[a-zA-Z]*A[a-zA-Z]*$/.test(a));
 }
 
 const commitsSigned = (seg) => gitCalls(seg).some((git) => git.sub === 'commit'
@@ -1113,4 +1123,4 @@ function main() {
 
 if (require.main === module) main();
 
-module.exports = { checkPre, checkPost, verdict, underDir, parseShell, BLOCK_RULES, WARN_RULES };
+module.exports = { checkPre, checkPost, verdict, underDir, parseShell, BLOCK_RULES, WARN_RULES, SECRET_PATTERNS };
