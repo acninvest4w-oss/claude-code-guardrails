@@ -7,10 +7,12 @@
 // DIFF_BASH=<path> picks the bash. Generated commands never use $vars, eval, bash -c,
 // scripts, xargs or ~: what the README lists as not followed is not tested here.
 //
-// IT RUNS `rm -rf *` FOR REAL. It does so only where that is isolated: in CI (a throwaway VM),
-// in a container, or with GUARDRAILS_DIFF_EXEC=1 on a machine you can afford to lose.
-// Elsewhere it skips. On a developer machine run it in a container:
-//   docker run --rm -v "$PWD:/repo:ro" node:22 bash -c "cp -r /repo /w && cd /w && node --test hooks/tests/differential.test.js"
+// IT RUNS `rm -rf *` FOR REAL. It does so only where that is isolated: in a container, on a
+// GitHub-hosted runner (a VM thrown away after the job; not a self-hosted runner, which is
+// someone's machine), or with GUARDRAILS_DIFF_EXEC=1 on a VM you can afford to lose.
+// Elsewhere it skips; DIFF_REQUIRE=bash,pwsh makes a skip or a missing shell a failure (CI
+// sets it, so a green run means the test ran). On a developer machine use the container CI uses:
+//   docker run --rm --network none --cap-drop ALL --security-opt no-new-privileges --user node --read-only --tmpfs /tmp:rw,size=512m --tmpfs /w:rw,exec,size=256m,mode=1777 -v "$PWD:/repo:ro" node:22 bash -c "cp -r /repo/. /w && cd /w && node --test hooks/tests/differential.test.js"
 const test = require('node:test');
 const assert = require('node:assert');
 const crypto = require('crypto');
@@ -23,8 +25,9 @@ const { checkPre } = require('../guard');
 const SEED = Number(process.env.DIFF_SEED) || Date.now() % 1e9;
 const RUNS = Number(process.env.DIFF_RUNS) || 150;
 const WIN = process.platform === 'win32';
-const ISOLATED = process.env.CI === 'true' || process.env.GUARDRAILS_DIFF_EXEC === '1'
+const ISOLATED = process.env.RUNNER_ENVIRONMENT === 'github-hosted' || process.env.GUARDRAILS_DIFF_EXEC === '1'
   || fs.existsSync('/.dockerenv') || fs.existsSync('/run/.containerenv');
+const REQUIRED = (process.env.DIFF_REQUIRE || '').split(',').filter(Boolean);
 
 function rng(seed) {
   let a = seed >>> 0;
@@ -250,8 +253,10 @@ test.after(() => {
 
 function differential(name, shell, runs) {
   test(`differential: ${name}`, (t) => {
-    if (!ISOLATED) return t.skip('runs rm -rf for real: only in CI, a container or with GUARDRAILS_DIFF_EXEC=1');
-    if (!shell.exe) return t.skip(`${name} not found`);
+    const why = !ISOLATED ? 'runs rm -rf for real: only in a container, on a GitHub-hosted runner or with GUARDRAILS_DIFF_EXEC=1'
+      : !shell.exe ? `${name} not found` : null;
+    if (why && REQUIRED.includes(name)) assert.fail(`DIFF_REQUIRE=${REQUIRED.join(',')} but: ${why}`);
+    if (why) return t.skip(why);
     const misses = [];
     let blocked = 0;
     let overBlocked = 0;

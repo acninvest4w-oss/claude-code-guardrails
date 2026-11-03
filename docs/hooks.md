@@ -98,9 +98,14 @@ twenty writing commands, asks the guard, then **runs it with real bash** (Git Ba
 Windows) or **pwsh** and diffs the tree. Each project sits deeper in its sandbox than any
 generated command can climb (`..` steps times loop passes), with a canary at the sandbox
 root that stops the run if it is ever touched. Those limit the damage; they are not a wall
-the OS enforces. So the test runs commands only where that is isolated: in CI, in a container,
-or with `GUARDRAILS_DIFF_EXEC=1` on a machine you can afford to lose. Anywhere else it skips. A protected file that changed while the guard said
-nothing fails the test. Commands use only what the guard claims to follow: no `$vars`,
+the OS enforces. So the test runs commands only where something else is: in a container, on a
+GitHub-hosted runner (a VM discarded after the job; a self-hosted runner is someone's
+machine and does not count), or with `GUARDRAILS_DIFF_EXEC=1` on a VM you can afford to lose.
+Anywhere else it skips. CI runs the Linux half in a container with no network, no
+capabilities, a non-root user, a read-only root and the repo mounted read-only, and the
+Windows half on the throwaway VM; there `DIFF_REQUIRE` turns a skip into a failure, so a
+green run means the test ran. A protected file that changed while the guard said nothing
+fails the test. Commands use only what the guard claims to follow: no `$vars`,
 `eval`, scripts or `~`.
 
 It found five kinds of miss, each fixed with a regression test:

@@ -226,7 +226,10 @@ tool call. [`hooks/hide.py`](hooks/hide.py) runs it under `pythonw` with
 
 ### Limits, in short
 
-A seatbelt against agent mistakes, not a sandbox against an adversary.
+A seatbelt against agent mistakes, not a sandbox against an adversary. It is not a security
+boundary: bad input fails open, and what it does not follow (below) it does not see. For a
+project with data that must not leak or be destroyed, `permissions.deny` rules and Claude
+Code's sandbox (or a container) are required; the hook is the layer on top that explains.
 
 - It reads the command string. Bash and PowerShell are tokenized like their shells,
   `cd`/`Set-Location` is followed, globs and braces are expanded against the real
@@ -270,7 +273,7 @@ python -m pytest -q gate/tests e2e/test_smoke_checks.py   # real pytest subproce
 node --test hooks/tests/guard.test.js hooks/tests/fuzz.test.js bench/tests/replay.test.js
 FUZZ_RUNS=5000 node --test hooks/tests/fuzz.test.js   # longer; FUZZ_SEED=<n> replays a failure
 # real bash/pwsh, runs rm -rf: skips outside CI or a container; DIFF_SEED=<n> replays
-docker run --rm -v "$PWD:/repo:ro" node:22 bash -c "cp -r /repo /w && cd /w && DIFF_RUNS=1000 node --test hooks/tests/differential.test.js"
+docker run --rm --network none --cap-drop ALL --security-opt no-new-privileges --user node --read-only --tmpfs /tmp:rw,size=512m --tmpfs /w:rw,exec,size=256m,mode=1777 -v "$PWD:/repo:ro" node:22 bash -c "cp -r /repo/. /w && cd /w && DIFF_RUNS=1000 node --test hooks/tests/differential.test.js"
 python e2e/smoke.py --model haiku     # real claude CLI, a few cents
 node bench/replay.js --root <project> ~/.claude/projects/<project-dir>   # your own false-block rate
 node bench/latency.js -- node hooks/guard.js                             # your own hook cost
