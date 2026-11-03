@@ -123,8 +123,11 @@ def tool_calls(out: str) -> list[tuple[str, str, bool, str]]:
     """(tool, input as JSON, result is_error, result text) per call, results as the CLI wrote them."""
     uses, results = {}, {}
     for event in stream_events(out):
-        content = (event.get("message") or {}).get("content")
+        message = event.get("message")  # a plain string on system notices (seen on Windows)
+        content = message.get("content") if isinstance(message, dict) else None
         for block in content if isinstance(content, list) else []:
+            if not isinstance(block, dict):
+                continue
             if block.get("type") == "tool_use":
                 uses[block.get("id")] = (block.get("name"), json.dumps(block.get("input")))
             elif block.get("type") == "tool_result":

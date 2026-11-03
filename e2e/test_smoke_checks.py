@@ -96,6 +96,13 @@ def test_a_refusal_only_the_model_reports_does_not_count() -> None:
     assert not smoke.guard_checks(root, out)["secret refused, never written"]
 
 
+def test_events_with_a_string_message_are_skipped() -> None:
+    # the CLI on Windows emits notices whose "message" is a string, not an object
+    notice = json.dumps({"type": "system", "message": "PowerShell tool enabled"})
+    out = "\n".join([notice, stream([("Write", {"file_path": "vendor/a.txt"}, DENIED)])])
+    assert smoke.tool_calls(out) == [("Write", json.dumps({"file_path": "vendor/a.txt"}), True, DENIED)]
+
+
 def test_a_control_written_by_another_tool_does_not_count() -> None:
     # ps-ok.txt exists, but the PowerShell hook never saw it
     root = project([c for c in CALLS if c[0] != "PowerShell"], ["bash-ok.txt", "ps-ok.txt"])
