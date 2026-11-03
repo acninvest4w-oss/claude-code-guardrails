@@ -85,8 +85,14 @@ def setup_guard_project(root: Path) -> None:
     sh(["git", "init", "-q"], root)
 
 
+def scratch(prefix: str) -> Path:
+    """A temp dir under its long name: Claude Code asks for manual approval (refused under -p)
+    of writes to a path with an 8.3 short name in it, such as C:\\Users\\RUNNER~1 on CI."""
+    return Path(tempfile.mkdtemp(prefix=prefix)).resolve()
+
+
 def check_guard(model: str) -> list[str]:
-    root = Path(tempfile.mkdtemp(prefix="guard_e2e_"))
+    root = scratch("guard_e2e_")
     setup_guard_project(root)
     res = sh(claude(model), root, GUARD_PROMPT)
     out = res.stdout
@@ -182,7 +188,7 @@ def guard_checks(root: Path, out: str) -> dict[str, bool]:
 
 
 def check_gate(model: str) -> list[str]:
-    root = Path(tempfile.mkdtemp(prefix="gate_e2e_"))
+    root = scratch("gate_e2e_")
     (root / "calc.py").write_text("def add(a, b):\n    return a - b\n")
     (root / "tests").mkdir()
     test = "from calc import add\n\ndef test_add():\n    assert add(2, 3) == 5\n"
