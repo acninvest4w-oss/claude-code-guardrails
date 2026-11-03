@@ -216,8 +216,11 @@ puts all 32,692 example commands of tldr-pages v2.3 (31,410 as Bash, 1,282 as Po
 through the guard in a project with a read-only `vendor/`, without executing them. 4 are
 blocked, all labelled true in [`tldr-labels.json`](../bench/corpus/tldr-labels.json):
 `git add -A` (twice), `git add .`, and `rmdir *` (it removes `vendor/` whenever that is
-empty). 0 false blocks. The labels are part of the test: a new block fails CI until someone
-labels it, so a parser change cannot quietly raise the false-block rate.
+empty). 0 false blocks. On a GitHub Windows runner two more block, both labelled true:
+`del /?` and `del /a ...` are cmd syntax, and read as PowerShell they name `\?` and `\a` at the
+drive root, which there is `D:\a`, the project's own parent. The labels are part of the
+test: a new block fails CI until someone labels it, so a parser change cannot quietly raise
+the false-block rate.
 
 The corpus measures false blocks on everyday syntax, not misses: its placeholders
 (`path/to/file`) rarely name a protected path. Misses are what the

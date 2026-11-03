@@ -1,14 +1,68 @@
 {
-  "corpus": "tldr-pages v2.3 (tldr-pages.en.zip), common + linux + osx as Bash, windows as PowerShell",
-  "project": "read-only vendor/ (not empty), .claude/settings.json, src/, tests/, path/to/file; nothing executed",
-  "blocked": [
-    { "tool": "Bash", "page": "common/git", "command": "git add -A", "rules": ["git-add-all"], "label": "true",
-      "why": "stages every change in the repo, .env and dumps included: what the rule exists for" },
-    { "tool": "Bash", "page": "common/git-add", "command": "git add -A", "rules": ["git-add-all"], "label": "true",
-      "why": "same command, on the git-add page" },
-    { "tool": "Bash", "page": "common/git-add", "command": "git add .", "rules": ["git-add-all"], "label": "true",
-      "why": "a whole-tree pathspec stages everything as -A does" },
-    { "tool": "Bash", "page": "common/rmdir", "command": "rmdir *", "rules": ["readonly-dir"], "label": "true",
-      "why": "removes vendor/ whenever it is empty; vendor/ is not empty here, so on this disk it would fail, but the call is an attempt to remove a read-only dir" }
-  ]
+ "corpus": "tldr-pages v2.3 (tldr-pages.en.zip), common + linux + osx as Bash, windows as PowerShell",
+ "project": "read-only vendor/ (not empty), .claude/settings.json, src/, tests/, path/to/file; nothing executed",
+ "blocked": [
+  {
+   "tool": "Bash",
+   "page": "common/git",
+   "command": "git add -A",
+   "rules": [
+    "git-add-all"
+   ],
+   "label": "true",
+   "why": "stages every change in the repo, .env and dumps included: what the rule exists for"
+  },
+  {
+   "tool": "Bash",
+   "page": "common/git-add",
+   "command": "git add -A",
+   "rules": [
+    "git-add-all"
+   ],
+   "label": "true",
+   "why": "same command, on the git-add page"
+  },
+  {
+   "tool": "Bash",
+   "page": "common/git-add",
+   "command": "git add .",
+   "rules": [
+    "git-add-all"
+   ],
+   "label": "true",
+   "why": "a whole-tree pathspec stages everything as -A does"
+  },
+  {
+   "tool": "Bash",
+   "page": "common/rmdir",
+   "command": "rmdir *",
+   "rules": [
+    "readonly-dir"
+   ],
+   "label": "true",
+   "why": "removes vendor/ whenever it is empty; vendor/ is not empty here, so on this disk it would fail, but the call is an attempt to remove a read-only dir"
+  },
+  {
+   "tool": "PowerShell",
+   "page": "windows/del",
+   "command": "del /?",
+   "rules": [
+    "guard-config"
+   ],
+   "label": "true",
+   "when": "the project sits under a one-letter dir at a drive root",
+   "why": "cmd syntax read as PowerShell: del is Remove-Item, so /? (a one-letter wildcard) is a path at the drive root. On a GitHub Windows runner the project sits under D:\\a, so it names the project's own parent and the .claude settings in it; elsewhere it names nothing and is allowed"
+  },
+  {
+   "tool": "PowerShell",
+   "page": "windows/del",
+   "command": "del file_pattern /a attribute",
+   "rules": [
+    "guard-config"
+   ],
+   "label": "true",
+   "when": "the project sits under a one-letter dir at a drive root",
+   "why": "cmd syntax read as PowerShell: del is Remove-Item, so /a is a path at the drive root. On a GitHub Windows runner the project sits under D:\\a, so it names the project's own parent and the .claude settings in it; elsewhere it names nothing and is allowed"
+  }
+ ]
 }
