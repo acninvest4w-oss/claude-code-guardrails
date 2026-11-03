@@ -18,9 +18,15 @@ Most rules exist because an agent did exactly that thing on a live project.
 - **Real traffic.** Replayed against 8,917 tool calls from 318 sessions of an active
   Windows monorepo, the hook blocked 39: 37 right, **2 wrong (0.02%)**.
   [Breakdown](docs/hooks.md#measured-on-a-real-project).
+- **A public corpus anyone can rerun.** All 32,692 example commands of
+  [tldr-pages](https://github.com/tldr-pages/tldr) go through the hook in CI: 4 blocked
+  (`git add -A` twice, `git add .`, `rmdir *` next to a read-only dir), **0 false**. Every
+  block is labelled by hand; a new one fails CI until it is.
+  [Corpus](bench/corpus/README.md).
 - **Real CLI.** [`e2e/smoke.py`](e2e/smoke.py) asks Claude to break each rule in a throwaway
   project: 13 hook checks over Bash and PowerShell, 3 gate checks. A refusal counts only
   from the hook's own log or the CLI's tool result, never from what the model says.
+  Runs in the open: [v1.3.0, Ubuntu, 12/12](https://github.com/acninvest4w-oss/claude-code-guardrails/actions/runs/41594073182).
 - **Attacked on purpose.** 11 rounds of adversarial review by a second model: each bypass
   it found is fixed with a regression test or listed under the limits. A seeded fuzz suite
   checks properties for both shells. CI runs it all on Ubuntu and Windows.
@@ -263,10 +269,12 @@ write failing test -> test_gate.py --expect-red -> green -> reviewer -> fix P1s 
 python -m pytest -q gate/tests e2e/test_smoke_checks.py   # real pytest subprocesses, fake fixer
 node --test hooks/tests/guard.test.js hooks/tests/fuzz.test.js bench/tests/replay.test.js
 FUZZ_RUNS=5000 node --test hooks/tests/fuzz.test.js   # longer; FUZZ_SEED=<n> replays a failure
-DIFF_RUNS=1000 node --test hooks/tests/differential.test.js   # real bash/pwsh; DIFF_SEED=<n> replays
+# real bash/pwsh, runs rm -rf: skips outside CI or a container; DIFF_SEED=<n> replays
+docker run --rm -v "$PWD:/repo:ro" node:22 bash -c "cp -r /repo /w && cd /w && DIFF_RUNS=1000 node --test hooks/tests/differential.test.js"
 python e2e/smoke.py --model haiku     # real claude CLI, a few cents
 node bench/replay.js --root <project> ~/.claude/projects/<project-dir>   # your own false-block rate
 node bench/latency.js -- node hooks/guard.js                             # your own hook cost
+node bench/corpus/check_corpus.js > blocked.json                         # tldr-pages corpus: what blocks
 ```
 
 The fuzz suite generates commands for both shells from a seed and checks properties rather
@@ -280,7 +288,9 @@ Windows on every push. The end-to-end smoke test
 with Claude asked to break each rule (verdicts read from the filesystem, the git index,
 the hook's own log and the CLI's tool results, not from the model's reply; a step refused
 by an `Edit(...)` deny counts only with the CLI's "denied" result for that call), then
-the gate fixing a real bug with the test file checked byte-for-byte. It runs on demand via the `e2e` workflow with an `ANTHROPIC_API_KEY` secret.
+the gate fixing a real bug with the test file checked byte-for-byte. It runs on demand via the `e2e` workflow (an `ANTHROPIC_API_KEY` secret,
+the CLI version pinned in the workflow), on Ubuntu (12 checks) and Windows (16, with the
+PowerShell tool), and prints the CLI version it ran.
 
 ## Tiếng Việt
 

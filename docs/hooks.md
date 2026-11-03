@@ -97,8 +97,9 @@ braces, quotes, `..`, absolute paths, subshells, `if`/`for`, pipes, background j
 twenty writing commands, asks the guard, then **runs it with real bash** (Git Bash on
 Windows) or **pwsh** and diffs the tree. Each project sits deeper in its sandbox than any
 generated command can climb (`..` steps times loop passes), with a canary at the sandbox
-root that stops the run if it is ever touched. Run it in a container or a VM if you change
-the generator: it executes `rm -rf *` for real. A protected file that changed while the guard said
+root that stops the run if it is ever touched. Those limit the damage; they are not a wall
+the OS enforces. So the test runs commands only where that is isolated: in CI, in a container,
+or with `GUARDRAILS_DIFF_EXEC=1` on a machine you can afford to lose. Anywhere else it skips. A protected file that changed while the guard said
 nothing fails the test. Commands use only what the guard claims to follow: no `$vars`,
 `eval`, scripts or `~`.
 
@@ -206,6 +207,21 @@ blocks: non-ASCII in `logger.*()` in code that runs on a cp1252 Windows host (34
 of `.claude/settings.json` (2), a bare `git add -A` (1). Warnings are advisory and were
 counted (for calls the hook let through), not classified: `broad-except-py` 156,
 `unicode-win-script` 42, `empty-catch-js` 6.
+
+### On a public corpus
+
+The numbers above come from one person's transcripts, classified by that person. To give
+anyone a number they can rerun, [`bench/tests/corpus.test.js`](../bench/tests/corpus.test.js)
+puts all 32,692 example commands of tldr-pages v2.3 (31,410 as Bash, 1,282 as PowerShell)
+through the guard in a project with a read-only `vendor/`, without executing them. 4 are
+blocked, all labelled true in [`tldr-labels.json`](../bench/corpus/tldr-labels.json):
+`git add -A` (twice), `git add .`, and `rmdir *` (it removes `vendor/` whenever that is
+empty). 0 false blocks. The labels are part of the test: a new block fails CI until someone
+labels it, so a parser change cannot quietly raise the false-block rate.
+
+The corpus measures false blocks on everyday syntax, not misses: its placeholders
+(`path/to/file`) rarely name a protected path. Misses are what the
+[differential test](#checked-against-real-shells) is for.
 
 Cost per hook call, measured with [`bench/latency.js`](../bench/latency.js) on Windows 11
 (i7-14700F, Node 24), process start included:

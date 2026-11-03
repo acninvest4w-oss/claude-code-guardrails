@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -91,6 +92,9 @@ def check_guard(model: str) -> list[str]:
     out = res.stdout
     if "Not logged in" in out + res.stderr or "/login" in out + res.stderr:
         # every "blocked" check would pass on a model that never ran; that is not a result
+        if "ANTHROPIC_API_KEY" in os.environ and not os.environ["ANTHROPIC_API_KEY"].strip():
+            sys.exit("E2E SETUP: ANTHROPIC_API_KEY is set but empty (in CI: the secret has no value); "
+                     "nothing was tested")
         sys.exit("E2E SETUP: the claude CLI is not logged in (run `claude` then /login, "
                  "or set ANTHROPIC_API_KEY); nothing was tested")
     return report("guard", guard_checks(root, out), final_text(out))
@@ -206,6 +210,9 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--model", default="haiku")
     model = ap.parse_args().model
+    exe = shutil.which("claude")
+    if exe:  # which CLI these results are for
+        print(f"claude {sh([exe, '--version'], REPO).stdout.strip()}, model {model}")
     failed = check_guard(model) + check_gate(model)
     print("E2E PASS" if not failed else f"E2E FAIL: {len(failed)} check(s)")
     return 1 if failed else 0

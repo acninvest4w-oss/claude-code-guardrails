@@ -6,6 +6,11 @@
 // DIFF_SEED=<n> reproduces a run, DIFF_RUNS=<n> sets the bash cases (pwsh runs a fifth),
 // DIFF_BASH=<path> picks the bash. Generated commands never use $vars, eval, bash -c,
 // scripts, xargs or ~: what the README lists as not followed is not tested here.
+//
+// IT RUNS `rm -rf *` FOR REAL. It does so only where that is isolated: in CI (a throwaway VM),
+// in a container, or with GUARDRAILS_DIFF_EXEC=1 on a machine you can afford to lose.
+// Elsewhere it skips. On a developer machine run it in a container:
+//   docker run --rm -v "$PWD:/repo:ro" node:22 bash -c "cp -r /repo /w && cd /w && node --test hooks/tests/differential.test.js"
 const test = require('node:test');
 const assert = require('node:assert');
 const crypto = require('crypto');
@@ -18,6 +23,8 @@ const { checkPre } = require('../guard');
 const SEED = Number(process.env.DIFF_SEED) || Date.now() % 1e9;
 const RUNS = Number(process.env.DIFF_RUNS) || 150;
 const WIN = process.platform === 'win32';
+const ISOLATED = process.env.CI === 'true' || process.env.GUARDRAILS_DIFF_EXEC === '1'
+  || fs.existsSync('/.dockerenv') || fs.existsSync('/run/.containerenv');
 
 function rng(seed) {
   let a = seed >>> 0;
@@ -30,19 +37,18 @@ function rng(seed) {
 }
 const pick = (r, list) => list[Math.floor(r() * list.length)];
 
-// Containment. A command may spell `..` at most MAX_UP times, and a loop wrapper runs its body
-// at most LOOP_PASSES times, so a case climbs at most MAX_UP * LOOP_PASSES levels. The project
-// sits PAD + 3 levels under the sandbox root, deeper than that, so whatever a case does, it
-// does inside the sandbox. The depth is the protection. A canary file at the sandbox root is
-// checked after every case and stops the run if it ever changes, but only after that case
-// ran: it limits the damage of a containment bug to one case, it does not prevent it.
+// Containment, inside the isolation above. Every generator returns its command with `passes`,
+// how many times its loop wrapper runs the body (1 without one; every loop it writes declares
+// it). A case climbs at most (`..` steps) * passes levels, and one that could reach the
+// sandbox root is never run: another is generated instead. The project sits PAD + 3 levels
+// under that root. A canary file at the root is checked after every case and stops the run
+// if it ever changes, but only after that case ran: it limits a containment bug to one case.
 // (Counting `..` alone was not enough: a loop wrapper doubled `cd ../..`, and an early
 // version of this test deleted *.txt files in the system temp dir.)
-const MAX_UP = 3;
-const LOOP_PASSES = 2;
 const PAD = 8;
 const PAD_DIRS = Array.from({ length: PAD }, (_, i) => `p${i}`);
-assert.ok(PAD + 3 > MAX_UP * LOOP_PASSES, 'the project must sit deeper than any case can climb');
+const MAX_CLIMB = PAD + 2; // PAD + 3 would land on the sandbox root itself
+const climb = ({ command, passes }) => (command.match(/\.\./g) || []).length * passes;
 const FILES = { 'README.md': 'a\n', 'a.txt': 'a\n', 'src/x.py': 'a\n', 'vendor/a.txt': 'a\n',
   'vendor/x.py': 'a\n', 'vendor/sub/b.txt': 'a\n', '.claude/settings.json': '{}\n',
   '.claude/guardrails.json': '{}\n', '.claude/other.txt': 'a\n' };
@@ -153,9 +159,11 @@ function bashCase(r, abs) {
     steps.push(write());
   }
   const joined = steps.reduce((acc, s, i) => (i ? acc + pick(r, ['; ', ' && ', ' || ', '\n', ' | ', ' & ']) + s : s), '');
-  return pick(r, [(c) => c, (c) => `( ${c} )`, (c) => `{ ${c}; }`, (c) => `if true; then ${c}; fi`,
-    (c) => `for i in 1 2; do ${c}; done`, (c) => `if false; then true; else ${c}; fi`, (c) => `echo $( ${c} )`,
-    (c) => `time for i in 1 2; do ${c}; done`, (c) => `! for i in 1 2; do ${c}; done`])(joined);
+  const [wrap, passes] = pick(r, [[(c) => c, 1], [(c) => `( ${c} )`, 1], [(c) => `{ ${c}; }`, 1],
+    [(c) => `if true; then ${c}; fi`, 1], [(c) => `for i in 1 2; do ${c}; done`, 2],
+    [(c) => `if false; then true; else ${c}; fi`, 1], [(c) => `echo $( ${c} )`, 1],
+    [(c) => `time for i in 1 2; do ${c}; done`, 2], [(c) => `! for i in 1 2; do ${c}; done`, 2]]);
+  return { command: wrap(joined), passes };
 }
 
 function psCase(r, abs) {
@@ -173,9 +181,10 @@ function psCase(r, abs) {
   const steps = Array.from({ length: 1 + Math.floor(r() * 3) }, () => pick(r, [write, write, cd])());
   if (steps.every((s) => /^(Set-Location|cd|Push-|Pop-)/.test(s))) steps.push(write());
   const joined = steps.reduce((acc, s, i) => (i ? acc + pick(r, ['; ', '\n', ' && ', ' || ']) + s : s), '');
-  return pick(r, [(c) => c, (c) => `& { ${c} }`, (c) => `if ($true) { ${c} }`, (c) => `try { ${c} } catch { $null = $_ }`,
-    (c) => `1 | ForEach-Object { ${c} }`, (c) => `1,2 | ForEach-Object -Begin { } -Process { ${c} }`,
-    (c) => `foreach ($i in 1,2) { ${c} }`])(joined);
+  const [wrap, passes] = pick(r, [[(c) => c, 1], [(c) => `& { ${c} }`, 1], [(c) => `if ($true) { ${c} }`, 1],
+    [(c) => `try { ${c} } catch { $null = $_ }`, 1], [(c) => `1 | ForEach-Object { ${c} }`, 1],
+    [(c) => `1,2 | ForEach-Object -Begin { } -Process { ${c} }`, 2], [(c) => `foreach ($i in 1,2) { ${c} }`, 2]]);
+  return { command: wrap(joined), passes };
 }
 
 // ---- the judge -----------------------------------------------------------------------------
@@ -184,9 +193,10 @@ function runCase({ tool, exe, argsFor, gen }, seed) {
   const box = sandbox();
   try {
     const abs = tool === 'Bash' && WIN ? toMsys(box.root) : box.root.replace(/\\/g, '/');
-    let command;
+    let made;
     const r = rng(seed);
-    do command = gen(r, abs); while ((command.match(/\.\./g) || []).length > MAX_UP || (!box.linked && /alias/.test(command)));
+    do made = gen(r, abs); while (climb(made) > MAX_CLIMB || (!box.linked && /alias/.test(made.command)));
+    const { command } = made;
     const verdict = checkPre({ tool_name: tool, tool_input: { command }, cwd: box.root },
       { env: { CLAUDE_PROJECT_DIR: box.root }, config: { readonly: ['vendor/'] }, gpgsign: () => 'false' });
     const before = snapshot(box.base);
@@ -240,6 +250,7 @@ test.after(() => {
 
 function differential(name, shell, runs) {
   test(`differential: ${name}`, (t) => {
+    if (!ISOLATED) return t.skip('runs rm -rf for real: only in CI, a container or with GUARDRAILS_DIFF_EXEC=1');
     if (!shell.exe) return t.skip(`${name} not found`);
     const misses = [];
     let blocked = 0;
