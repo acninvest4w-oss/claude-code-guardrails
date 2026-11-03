@@ -175,12 +175,15 @@ const lit = (ch) => LIT[ch] || ch;
 const plain = (w) => w.replace(/[\uE001-\uE006]/g, (c) => UNLIT[c]);
 const ANSI_C = { n: '\n', t: '\t', r: '\r', e: '\x1b', a: '\x07', 0: '\0', '\\': '\\', "'": "'", '"': '"' };
 
+// `quoted` runs parallel to `words`: a word with any quote or escape in it is never a
+// keyword ('}' or 'fi' as a command name closes nothing).
 function endWord(lx) {
   if (lx.cur === null) return;
   if (lx.pending === 'out') lx.redirs.push(lx.cur);
   else if (lx.pending === 'heredoc') lx.heredocs.push(plain(lx.cur));
-  else if (lx.pending !== 'in') lx.words.push(lx.cur);
+  else if (lx.pending !== 'in') { lx.words.push(lx.cur); lx.quoted.push(lx.curQuoted); }
   lx.cur = null;
+  lx.curQuoted = false;
   lx.pending = null;
 }
 
@@ -190,6 +193,50 @@ const COND_WORDS = new Set(['if', 'elif', 'while', 'until', '!']);
 const BODY_OPEN = new Set(['if', 'while', 'until', 'for', 'select', 'case']);
 const BODY_CLOSE = new Set(['fi', 'done', 'esac']);
 const CONDITIONAL = new Set(['&&', '||']);
+const LOOP_WORDS = new Set(['for', 'while', 'until', 'select']);
+// Operators that end an and-or list: what follows starts a new one.
+const LIST_ENDS = new Set([';', '\n', '&']);
+
+// The keyword a segment starts with, past the words that only continue a compound
+// command or prefix it: "then for i in ...", "! for ...", "time -p for ..." open a loop
+// just as "for i in ..." does.
+const LEADERS = new Set(['then', 'else', 'do', '!', 'time']);
+
+// A word as a keyword: '' when it was quoted or escaped.
+const keyword = (words, quoted, i) => (quoted && quoted[i] ? '' : plain(words[i] || ''));
+
+// Index of the first word past the leaders, and with `group` past "{" too.
+function pastLeaders(words, quoted, group) {
+  let i = 0;
+  for (;; i++) {
+    const w = keyword(words, quoted, i);
+    if (!(LEADERS.has(w) || (group && w === '{') || (w.startsWith('-') && keyword(words, quoted, i - 1) === 'time'))) break;
+  }
+  return i;
+}
+
+const headWord = (words, quoted) => keyword(words, quoted, pastLeaders(words, quoted, true));
+// "{ ...", "! { ...", "then { ...": the segment opens a brace group
+const opensGroup = (words, quoted) => keyword(words, quoted, pastLeaders(words, quoted, false)) === '{';
+
+// The and-or list a `&` puts in the background starts at the top of `lx.lists`: one level
+// per subshell and per compound command ({ }, if, for, while, case), so a `;` inside
+// "cd x && { a; b; } &" does not cut the list short.
+const listTop = (lx) => lx.lists[lx.lists.length - 1];
+
+// A stray "}" or "fi" never closes a subshell's level; a ")" closes any compound left open in it.
+function popList(lx, kind) {
+  if (kind === 'scope') while (lx.lists.length > 1 && listTop(lx).kind === 'compound') lx.lists.pop();
+  return lx.lists.length > 1 && listTop(lx).kind === kind ? lx.lists.pop() : null;
+}
+
+// "for ...; done | cat", "if ...; fi &": a compound in a pipeline or in the background runs
+// in a child shell, so its segments get their own scope (brace groups: closeGroup).
+function scopeCompound(lx, level, op) {
+  if (!level || !(level.piped || op === '|' || op === '&')) return;
+  const id = lx.nextScope++;
+  for (let k = level.start; k < lx.segs.length; k++) lx.segs[k].scope.splice(level.depth, 0, id);
+}
 
 // A simple command ends at an operator. `scope` = ids of the subshells it runs in;
 // `sub` = it runs in a child shell anyway (pipeline member, background job);
@@ -197,17 +244,30 @@ const CONDITIONAL = new Set(['&&', '||']);
 function endSegment(lx, op = ';') {
   endWord(lx);
   if (lx.words.length || lx.redirs.length) {
-    const first = plain(lx.words[0] || '');
-    if (first === '{') lx.groups.push({ start: lx.segs.length, piped: lx.prevOp === '|', depth: lx.scopes.length });
-    if (BODY_OPEN.has(first)) lx.bodies++;
-    lx.segs.push({ words: lx.words, redirs: lx.redirs, scope: [...lx.scopes], after: lx.prevOp,
+    const first = keyword(lx.words, lx.quoted, 0);
+    const head = headWord(lx.words, lx.quoted);
+    const group = opensGroup(lx.words, lx.quoted);
+    if (group) lx.groups.push({ start: lx.segs.length, piped: lx.prevOp === '|', depth: lx.scopes.length });
+    if (BODY_OPEN.has(head)) lx.bodies++;
+    if (head === 'case') lx.cases.push({ pattern: true });
+    if (LIST_ENDS.has(lx.prevOp)) listTop(lx).at = lx.segs.length;
+    // inside a compound that may be skipped ("false && { a; cd x; }"), every command may be
+    const inSkippable = lx.lists.some((l) => l.cond);
+    if (group || BODY_OPEN.has(head)) {
+      lx.lists.push({ at: lx.segs.length, start: lx.segs.length, kind: 'compound', depth: lx.scopes.length,
+        piped: lx.prevOp === '|', cond: CONDITIONAL.has(lx.prevOp) || inSkippable });
+    }
+    lx.segs.push({ words: lx.words, quoted: lx.quoted, redirs: lx.redirs, scope: [...lx.scopes], after: lx.prevOp,
       sub: op === '|' || op === '&' || lx.prevOp === '|',
-      cond: lx.bodies > 0 || CONDITIONAL.has(lx.prevOp) || COND_WORDS.has(first) });
+      cond: lx.bodies > 0 || inSkippable || CONDITIONAL.has(lx.prevOp) || COND_WORDS.has(first) || COND_WORDS.has(head) });
     if (BODY_CLOSE.has(first)) lx.bodies = Math.max(0, lx.bodies - 1);
-    if (first === '}') closeGroup(lx, op);
+    if (first === 'esac') lx.cases.pop();
+    if (BODY_CLOSE.has(first)) scopeCompound(lx, popList(lx, 'compound'), op);
+    if (first === '}') { popList(lx, 'compound'); closeGroup(lx, op); }
     lx.prevOp = op;
   }
   lx.words = [];
+  lx.quoted = [];
   lx.redirs = [];
   lx.pending = null;
 }
@@ -224,19 +284,81 @@ function closeGroup(lx, op) {
   }
 }
 
+// "cd x && make &": `&` puts the whole and-or list in a child shell, not just its last
+// command, so the list gets its own scope -- its cds do not move what comes after.
+function backgroundList(lx) {
+  const start = listTop(lx).at;
+  const id = lx.nextScope++;
+  for (let k = start; k < lx.segs.length; k++) lx.segs[k].scope.splice(lx.scopes.length, 0, id);
+  lx.prevOp = '&';
+}
+
 // ( $( and ` open a subshell with a fresh scope id, ) and the closing ` end it;
 // && and || are one operator.
 function readOperator(lx, ch) {
+  if (readCaseSyntax(lx, ch)) return;
   const two = lx.cmd.slice(lx.i, lx.i + 2);
   const op = two === '&&' || two === '||' ? two : ch;
   lx.i += op.length - 1;
   endSegment(lx, op);
   const opens = ch === '(' || (ch === '`' && !lx.tick);
   const closes = ch === ')' || (ch === '`' && lx.tick);
-  if (opens) lx.scopes.push(lx.nextScope++);
-  else if (closes && lx.scopes.length > 1) lx.scopes.pop();
+  if (opens) {
+    if (LIST_ENDS.has(lx.prevOp)) listTop(lx).at = lx.segs.length;
+    lx.scopes.push(lx.nextScope++);
+    lx.lists.push({ at: lx.segs.length, kind: 'scope' });
+  } else if (closes && lx.scopes.length > 1) {
+    lx.scopes.pop();
+    popList(lx, 'scope');
+  }
+  if (op === '&') backgroundList(lx);
   if (ch === '`') lx.tick = !lx.tick;
   if (ch === '\n') skipHeredocs(lx);
+}
+
+// Inside case ... esac, ")" ends a pattern and ";;" / ";&" / ";;&" end an arm: neither closes
+// a subshell or puts anything in the background. A "(" before a pattern opens nothing.
+const ARM_END = /^;(;&?|&)/;
+
+function readCaseSyntax(lx, ch) {
+  const kase = lx.cases[lx.cases.length - 1];
+  const arm = kase && ch === ';' && lx.cmd.slice(lx.i).match(ARM_END);
+  if (arm) {
+    endSegment(lx, ';');
+    lx.i += arm[0].length - 1;
+    kase.pattern = true;
+    return true;
+  }
+  endWord(lx);
+  // "case x in x)": the header and the first pattern end at the same ")"
+  const header = headWord(lx.words, lx.quoted) === 'case' && lx.words.some((_, i) => keyword(lx.words, lx.quoted, i) === 'in');
+  const pattern = header || (kase && kase.pattern && keyword(lx.words, lx.quoted, 0) !== 'esac');
+  if (ch === '(' && kase && kase.pattern && !lx.words.length) return true;
+  if (ch !== ')' || !pattern) return false;
+  endSegment(lx, ';');
+  lx.cases[lx.cases.length - 1].pattern = false;
+  return true;
+}
+
+// Loop bodies as [first, end) segment ranges: from the for/while/until line to its "done".
+// "for x in one" over a single literal word runs once: no range, nothing to read twice.
+function loopRanges(segs) {
+  const open = [];
+  const ranges = [];
+  segs.forEach((s, i) => {
+    if (LOOP_WORDS.has(headWord(s.words, s.quoted))) open.push(runsOnce(s.words) ? -1 : i);
+    else if (keyword(s.words, s.quoted, 0) === 'done' && open.length) {
+      const start = open.pop();
+      if (start >= 0) ranges.push([start, i]);
+    }
+  });
+  return ranges;
+}
+
+function runsOnce(words) {
+  const w = words.map(plain);
+  const k = w.indexOf('in');
+  return w.includes('for') && k > 0 && w.length === k + 2 && !/[*?[{$`]/.test(w[k + 1]);
 }
 
 // At "<" or ">": the next word is a file read, a file written, or a heredoc delimiter.
@@ -312,11 +434,15 @@ function readQuoted(lx, ch) {
 function openQuote(lx, kind) {
   lx.quote = kind;
   lx.cur = lx.cur ?? '';
+  lx.curQuoted = true;
 }
 
 function readBackslash(lx) {
   const next = lx.cmd[++lx.i];
-  if (next !== undefined && next !== '\n') lx.cur = (lx.cur ?? '') + lit(next); // \<newline> = continuation
+  if (next !== undefined && next !== '\n') { // \<newline> = continuation
+    lx.cur = (lx.cur ?? '') + lit(next);
+    lx.curQuoted = true;
+  }
 }
 
 function skipComment(lx) {
@@ -329,7 +455,7 @@ function skipComment(lx) {
 function parseShell(cmd) {
   const lx = { cmd, i: 0, segs: [], words: [], redirs: [], cur: null, pending: null,
     quote: null, heredocs: [], scopes: [0], nextScope: 1, groups: [], bodies: 0, nul: false,
-    tick: false, prevOp: ';' };
+    tick: false, prevOp: ';', lists: [{ at: 0, kind: 'top' }], quoted: [], curQuoted: false, cases: [] };
   for (; lx.i < cmd.length; lx.i++) {
     const ch = cmd[lx.i];
     if (lx.quote) readQuoted(lx, ch);
@@ -344,6 +470,7 @@ function parseShell(cmd) {
     else lx.cur = (lx.cur ?? '') + ch;
   }
   endSegment(lx);
+  lx.segs.loops = loopRanges(lx.segs);
   return lx.segs;
 }
 
@@ -364,30 +491,39 @@ function skipWrapperOptions(words, i, valueOpt) {
 // Shell keywords that can stand before a command: "if cd x; then ...", "{ cd x; }".
 const RESERVED = new Set(['{', '}', '!', 'if', 'then', 'else', 'elif', 'do', 'while', 'until']);
 
+// Wrappers that run their command in the calling shell; the others (env, sudo, nohup, nice,
+// exec) start a new process, so a cd under them moves nothing ("env cd src" just fails).
+const IN_SHELL = new Set(['command', 'builtin', 'time']);
+
 // Strip VAR=x prefixes, keywords and wrappers like sudo/env/command: { name: 'cp', args: [...] }.
-function commandOf(words) {
+// A quoted keyword is a command name ('!' cd src runs a program called "!"). `inShell`: no
+// wrapper between the shell and the command that starts a process of its own.
+function commandOf(words, quoted) {
   let i = 0;
+  let inShell = true;
   while (i < words.length) {
     const w = plain(words[i]);
-    if (/^\w+=/.test(w) || RESERVED.has(w)) i++;
-    else if (WRAPPERS.has(nameOf(w))) i = skipWrapperOptions(words, i + 1, WRAPPERS.get(nameOf(w)));
-    else break;
+    if (/^\w+=/.test(w) || (RESERVED.has(w) && !(quoted && quoted[i]))) i++;
+    else if (WRAPPERS.has(nameOf(w))) {
+      inShell = inShell && IN_SHELL.has(nameOf(w));
+      i = skipWrapperOptions(words, i + 1, WRAPPERS.get(nameOf(w)));
+    } else break;
   }
-  return { name: nameOf(words[i]), args: words.slice(i + 1) };
+  return { name: nameOf(words[i]), args: words.slice(i + 1), inShell };
 }
 
 const nameOf = (w) => nodePath.basename(plain(w || '')).replace(/\.exe$/i, '').toLowerCase();
 
 // The precise reading, plus every later word after a wrapper as a possible command start,
 // in case a wrapper option took a value this parser does not know (env --unset FOO git).
-function commandsOf(words) {
-  const main = commandOf(words);
+function commandsOf(words, quoted) {
+  const main = commandOf(words, quoted);
   const first = words.findIndex((w) => WRAPPERS.has(nameOf(w)));
   if (first < 0) return [main];
   const alts = [];
   for (let i = first + 1; i < words.length; i++) {
     const w = plain(words[i]);
-    if (!w.startsWith('-') && !/^\w+=/.test(w)) alts.push({ name: nameOf(w), args: words.slice(i + 1) });
+    if (!w.startsWith('-') && !/^\w+=/.test(w)) alts.push({ name: nameOf(w), args: words.slice(i + 1), inShell: false });
   }
   return [main, ...alts];
 }
@@ -431,14 +567,21 @@ function targetDir(args) {
 }
 
 // cp/mv/install/ln: the destination, plus dest/<basename of each source> in case dest is a dir.
+// mv also removes its sources. ln makes its sources writable under a new name ("ln -s
+// vendor/x y; echo > y" writes vendor/x), so they count as written too: from the current
+// dir, and for a symlink from the link's own dir, where its target resolves.
 function copyOps(name, args) {
   const target = targetDir(args);
   const skip = new Set(target ? target.skip : []);
   const { operands } = splitArgs(args.filter((_, i) => !skip.has(i)));
-  const dest = target ? target.dir : operands.pop();
+  // "ln -s ../x" (one operand, no -t): the link is ./x
+  const single = name === 'ln' && !target && operands.length === 1;
+  const dest = target ? target.dir : single ? nodePath.posix.basename(plain(operands[0])) : operands.pop();
   if (!dest) return [];
   const into = operands.map((s) => treeOp(`${dest}/${nodePath.basename(s)}`));
-  return [writeOp(dest), ...into, ...(name === 'mv' ? operands.map(treeOp) : [])];
+  const linked = name !== 'ln' ? [] : operands.flatMap((s) => (isAbs(s) ? [s]
+    : [s, `${dest}/${s}`, `${nodePath.posix.dirname(dest)}/${s}`])).map(treeOp);
+  return [writeOp(dest), ...into, ...(name === 'mv' ? operands.map(treeOp) : []), ...linked];
 }
 
 // sed -i: the script is -e/-f's value, or else the first operand; the rest are files.
@@ -458,7 +601,7 @@ function sedOps(args) {
 // Files one simple command writes or removes, by command name.
 function fileOps(name, args) {
   const { operands } = splitArgs(args);
-  if (['tee', 'touch', 'truncate'].includes(name)) return operands.map(writeOp);
+  if (['tee', 'touch', 'truncate', 'mkdir'].includes(name)) return operands.map(writeOp);
   if (['rm', 'rmdir', 'unlink', 'shred'].includes(name)) return operands.map(treeOp);
   if (['cp', 'mv', 'install', 'ln'].includes(name)) return copyOps(name, args);
   if (name === 'sed') return sedOps(args);
@@ -582,7 +725,8 @@ const LETTERS = 'abcdefghijklmnopqrstuvwxyz'.split('');
 
 function anchorOp(op, cwd, budget) {
   const variants = expandBraces(op.path, budget);
-  if (variants.length > 1) return variants.flatMap((v) => anchorOp({ ...op, path: v }, cwd, budget));
+  // ven{d..d}or is one word, but not the word as written
+  if (variants.length > 1 || variants[0] !== op.path) return variants.flatMap((v) => anchorOp({ ...op, path: v }, cwd, budget));
   const drives = driveMounts && op.path.match(DRIVE_GLOB);
   if (drives) {
     const hits = LETTERS.filter(globMatcher(drives[1]));
@@ -616,8 +760,10 @@ function frameFor(frames, scope) {
   return frame;
 }
 
-// Where cd/pushd/popd would take the frame (before deciding if that is certain).
-function dirTargets(frame, name, arg) {
+// Where cd/pushd/popd would take the frame (before deciding if that is certain). The
+// argument is expanded like any other word: `cd v*` goes where the glob matches.
+function dirTargets(frame, name, word, budget) {
+  const arg = plain(word);
   if (name === 'popd') return frame.stack.length ? frame.stack.pop() : frame.dirs;
   if (name === 'pushd' && !arg) { // swap with the top of the stack
     const top = frame.stack.length ? frame.stack.pop() : frame.dirs;
@@ -625,7 +771,8 @@ function dirTargets(frame, name, arg) {
     return top;
   }
   if (name === 'pushd') frame.stack.push(frame.dirs);
-  return arg === '-' ? frame.prev : frame.dirs.map((d) => at(d, home(arg || '~')));
+  if (arg === '-') return frame.prev;
+  return frame.dirs.flatMap((d) => anchorOp({ path: word || '~' }, d, budget).map((l) => l.path));
 }
 
 // A cd that may not run (after &&/||, inside if/for/while/case) or whose target is not
@@ -639,16 +786,62 @@ function isDir(p) {
   }
 }
 
-function changeDir(frame, name, args, cond) {
-  moveTo(frame, dirTargets(frame, name, plain(splitArgs(args).operands[0] || '')), cond);
+// Several arguments written out: bash refuses ("too many arguments") and stays put. From a
+// glob or brace that expands to several names: the same, but the count depends on the disk
+// at run time, so the old dirs and the matches both stay possible.
+function changeDir(frame, name, args, cond, budget) {
+  const before = frame.dirs.length;
+  const { operands } = splitArgs(args);
+  if (name !== 'popd' && operands.length > 1) return; // "cd a b": too many arguments, stays put
+  const next = dirTargets(frame, name, operands[0] || '', budget);
+  moveTo(frame, next, cond || next.length > before);
+}
+
+// "x/src/.." and "x" are one directory when both ways of resolving them agree: keep the
+// first spelling, so "cd src; ...; cd .." in a loop does not count the same dir twice.
+function sameDirsOnce(dirs) {
+  const seen = new Map();
+  for (const d of dirs) {
+    const key = landings(d, '').map((s) => s.join('/')).join('|');
+    if (!seen.has(key)) seen.set(key, d);
+  }
+  return [...seen.values()];
 }
 
 function moveTo(frame, next, cond) {
   const unsure = cond || !next.every(isDir); // cd into a file or a missing dir fails
-  const dirs = [...new Set(unsure ? [...frame.dirs, ...next] : next)];
+  const dirs = sameDirsOnce(unsure ? [...frame.dirs, ...next] : next);
   if (dirs.length > MAX_DIRS) throw new Error('too many possible working directories to check');
   frame.prev = frame.dirs;
   frame.dirs = dirs;
+}
+
+// A loop body runs again from where its last pass left the shell ("for ...; do touch x;
+// cd vendor; done" writes vendor/x the second time), so each body is read twice in a row.
+// The copy gets fresh ids for the subshells inside it: each pass starts them anew from
+// where the loop is. A cd that only lands after three or more passes is not followed.
+const MAX_UNROLLED = 2000;
+
+function unrollLoops(segs) {
+  const ranges = (segs.loops || []).slice().sort((a, b) => a[0] - b[0] || b[1] - a[1]);
+  let fresh = 1e6;
+  const walk = (lo, hi, rs) => {
+    const out = [];
+    for (let i = lo; i < hi;) {
+      const k = rs.findIndex(([a, b]) => a === i && b <= hi);
+      if (k < 0) { out.push(segs[i++]); continue; }
+      const [a, b] = rs[k];
+      const body = walk(a, b, rs.filter((r, j) => j !== k && r[0] >= a && r[1] <= b));
+      const outer = new Set(segs[a].scope);
+      const ids = new Map();
+      const rename = (id) => (outer.has(id) ? id : ids.get(id) ?? ids.set(id, fresh++).get(id));
+      out.push(...body, ...body.map((s) => ({ ...s, scope: s.scope.map(rename) })));
+      if (out.length > MAX_UNROLLED) throw new Error('loops nested too deep to check');
+      i = b;
+    }
+    return out;
+  };
+  return walk(0, segs.length, ranges);
 }
 
 // Every file a command line touches, relative paths anchored at each dir the shell may be
@@ -660,9 +853,9 @@ function shellOps(segs, startDir, ps = false) {
   const frames = new Map([[0, { dirs: [startDir], prev: [startDir], stack: [] }]]);
   const budget = { left: MAX_EXPANSIONS };
   const ops = [];
-  for (const seg of segs) {
+  for (const seg of unrollLoops(segs)) {
     const frame = ps ? frames.get(0) : frameFor(frames, seg.scope);
-    const cmds = commandsOf(seg.words);
+    const cmds = commandsOf(seg.words, seg.quoted);
     const opsOf = (c) => (ps && PS_FILE_CMDS[c.name] ? psFileOps(c.name, c.args, seg.upstream)
       : fileOps(c.name, c.args));
     const local = cmds.flatMap(opsOf).concat(seg.redirs.map(writeOp))
@@ -670,9 +863,9 @@ function shellOps(segs, startDir, ps = false) {
       .map((o) => (ps ? { ...o, dot: true } : o));
     const bases = frame.dirs.flatMap((d) => [d, ...wrapperDirs(seg.words).map((w) => at(d, home(w)))]);
     for (const base of bases) ops.push(...local.flatMap((o) => anchorOp(o, base, budget)));
-    const { name, args } = cmds[0];
+    const { name, args, inShell } = cmds[0];
     if (ps && PS_LOCATION[name]) psChangeDir(frame, PS_LOCATION[name], args, seg.cond, budget);
-    else if (!ps && ['cd', 'pushd', 'popd'].includes(name) && !seg.sub) changeDir(frame, name, args, seg.cond);
+    else if (!ps && inShell && ['cd', 'pushd', 'popd'].includes(name) && !seg.sub) changeDir(frame, name, args, seg.cond, budget);
   }
   return ops;
 }
@@ -732,6 +925,11 @@ function psToPosix(raw) {
   return out;
 }
 
+// A { } block right after foreach / for / while / do / until / ForEach-Object / % is a loop
+// body: a loop range for unrollLoops. So is a block that follows a loop block with only
+// parameter names between them: "ForEach-Object -Begin { } -Process { ... }".
+const PS_LOOPS = new Set(['foreach', 'for', 'while', 'do', 'until', 'foreach-object', '%']);
+
 // Each { } block boundary starts a new command: "try { Set-Content x } catch { }" is
 // "try", "Set-Content x", "catch". A command in any block may not run (if/else/loop
 // bodies, scriptblocks maybe never invoked), nor one after && / || or in a pipeline / job,
@@ -740,23 +938,39 @@ function psToPosix(raw) {
 // redirects go with its last command.
 function psFlow(segs) {
   const out = [];
+  const opened = [];
+  out.loops = [];
   let depth = 0;
   let upstream = [];
+  let since = []; // words since the last brace, across segments: "foreach ($i in 1,2) {"
+  let lastLoop = false; // the block that just closed was a loop's
   for (const seg of segs) {
     const piped = seg.after === '|' ? upstream : [];
     const cond = () => depth > 0 || CONDITIONAL.has(seg.after) || seg.sub;
     const parts = [];
     let cur = [];
-    for (const w of seg.words) {
-      if (w !== '{' && w !== '}') { cur.push(w); continue; }
-      if (cur.length) parts.push({ words: cur, cond: cond() });
+    let curQ = [];
+    seg.words.forEach((w, wi) => {
+      if (w !== '{' && w !== '}') { cur.push(w); curQ.push(Boolean(seg.quoted && seg.quoted[wi])); since.push(w); return; }
+      if (cur.length) parts.push({ words: cur, quoted: curQ, cond: cond() });
       cur = [];
+      curQ = [];
+      const loop = since.some((b) => PS_LOOPS.has(plain(b).toLowerCase()))
+        || (lastLoop && since.every((b) => plain(b).startsWith('-')));
+      if (w === '{') opened.push({ start: out.length + parts.length, loop });
+      else if (opened.length) {
+        const block = opened.pop();
+        if (block.loop) out.loops.push([block.start, out.length + parts.length]);
+        lastLoop = block.loop;
+      }
+      since = [];
       depth = w === '{' ? depth + 1 : Math.max(0, depth - 1);
-    }
-    if (cur.length || seg.redirs.length) parts.push({ words: cur, cond: cond() });
+    });
+    if (cur.length || seg.redirs.length) parts.push({ words: cur, quoted: curQ, cond: cond() });
     parts.forEach((p, i) => out.push({ ...seg, ...p, redirs: i === parts.length - 1 ? seg.redirs : [], upstream: piped }));
     upstream = piped.concat(psSources(seg.words.filter((w) => w !== '{' && w !== '}')));
   }
+  out.loops = out.loops.filter(([a, b]) => b > a);
   return out;
 }
 
@@ -789,7 +1003,7 @@ function psChangeDir(frame, name, args, cond, budget) {
   const to = b.path.concat(b.pos[0] || []).map(psGlob).concat(b.literal)[0];
   if (name === 'pushd' && to === undefined) frame.stack.push(frame.dirs);
   else if (name === 'popd' || to === undefined || !GLOB_SEG.test(to)) {
-    changeDir(frame, name, to === undefined ? [] : ['--', to], cond);
+    changeDir(frame, name, to === undefined ? [] : ['--', to], cond, budget);
   } else {
     if (name === 'pushd') frame.stack.push(frame.dirs);
     const next = frame.dirs.flatMap((d) => anchorOp({ path: to, tree: false, dot: true }, d, budget).map((o) => o.path));
@@ -913,7 +1127,7 @@ function psFileOps(name, args, upstream = []) {
 
 // `git [-C dir] [-c k=v] <sub> <args>` -> { sub, args, config } for each reading of the
 // command that is git (plain words).
-const gitCalls = (seg) => commandsOf(seg.words).filter((c) => c.name === 'git').map(gitCall);
+const gitCalls = (seg) => commandsOf(seg.words, seg.quoted).filter((c) => c.name === 'git').map(gitCall);
 
 function gitCall({ args: raw }) {
   const args = raw.map(plain);

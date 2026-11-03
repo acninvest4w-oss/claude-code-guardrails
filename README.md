@@ -24,6 +24,11 @@ Most rules exist because an agent did exactly that thing on a live project.
 - **Attacked on purpose.** 11 rounds of adversarial review by a second model: each bypass
   it found is fixed with a regression test or listed under the limits. A seeded fuzz suite
   checks properties for both shells. CI runs it all on Ubuntu and Windows.
+- **Real shells as the judge.** Generated commands run for real in bash and pwsh, and the
+  tree is diffed: a protected file that changed while the hook said nothing fails the test.
+  Seventeen kinds of miss found that way and by red-team review are fixed; 13,800 cases
+  since, none let through.
+  [How](docs/hooks.md#checked-against-real-shells).
 - **Cheap.** About 50 ms per tool call (about 85 ms with the Windows no-flash wrapper),
   almost all of it starting processes; the check itself is 0.2 ms.
 
@@ -224,6 +229,8 @@ A seatbelt against agent mistakes, not a sandbox against an adversary.
   `eval`/`Invoke-Expression`, `xargs`, `find -delete`, .NET calls.
 - Where it cannot tell (more than 8 possible directories, more than 2000 expanded names)
   it stops the call instead of guessing.
+- A loop body is read twice, for its first pass and one more: a `cd` that only lands
+  somewhere after three or more passes is not followed.
 - For hard file boundaries, use `permissions.deny` `Edit(...)` rules and Claude Code's
   sandbox; the example settings ship both layers. An `Edit(...)` deny refuses a Write
   before the hook runs, so there the rule is the check and the hook the backstop.
@@ -256,6 +263,7 @@ write failing test -> test_gate.py --expect-red -> green -> reviewer -> fix P1s 
 python -m pytest -q gate/tests e2e/test_smoke_checks.py   # real pytest subprocesses, fake fixer
 node --test hooks/tests/guard.test.js hooks/tests/fuzz.test.js bench/tests/replay.test.js
 FUZZ_RUNS=5000 node --test hooks/tests/fuzz.test.js   # longer; FUZZ_SEED=<n> replays a failure
+DIFF_RUNS=1000 node --test hooks/tests/differential.test.js   # real bash/pwsh; DIFF_SEED=<n> replays
 python e2e/smoke.py --model haiku     # real claude CLI, a few cents
 node bench/replay.js --root <project> ~/.claude/projects/<project-dir>   # your own false-block rate
 node bench/latency.js -- node hooks/guard.js                             # your own hook cost
@@ -266,7 +274,8 @@ than cases: random text never crashes the guard; quoted text, comments, heredoc 
 here-string bodies never block; benign commands chained or wrapped around a protected write
 never hide it; every spelling of a protected path (quotes, escapes, `..`, `//`, case on
 Windows, `\`, `/c/`, `FileSystem::`) blocks; verdicts do not depend on earlier calls.
-CI runs the unit tests and the fuzz suite on Ubuntu and Windows on every push. The end-to-end smoke test
+CI runs the unit tests, the fuzz suite and the real-shell differential test on Ubuntu and
+Windows on every push. The end-to-end smoke test
 ([`e2e/smoke.py`](e2e/smoke.py)) runs the real CLI: hooks wired into a throwaway project
 with Claude asked to break each rule (verdicts read from the filesystem, the git index,
 the hook's own log and the CLI's tool results, not from the model's reply; a step refused

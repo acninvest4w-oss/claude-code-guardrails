@@ -12,16 +12,22 @@ A seatbelt against agent mistakes, not a sandbox against an adversary.
 - It reads `Edit`/`Write`/`MultiEdit` input and the Bash **command string**. Bash is
   tokenized like a shell (`''`, `""`, `$''` quotes, escapes, comments, heredoc bodies
   skipped, `if`/`{` keywords, `sudo`/`env`/`command` wrappers with their options).
-  Relative paths follow the shell's real directory: literal `cd`, `cd -`, `pushd`/`popd`,
-  `env -C`, with `( )`, `$( )`, pipelines, `&` jobs and piped/backgrounded `{ }` groups not
-  moving the parent. A `cd` that may be skipped (after `&&`/`||`, inside `if`/`for`/
-  `while`/`case`) or fail (target not a directory) keeps the old directory possible too,
-  and a write is checked against every possibility. This approximates bash, it does not
-  run it: where the outcome depends on exit statuses or loop counts, the guard keeps
-  every candidate directory, and past 8 candidates it stops the call instead of guessing. It finds what these
-  write or remove: redirects, `tee`, `touch`, `truncate`, `sed -i`, `dd of=`, `rm`/`rmdir`
+  Relative paths follow the shell's real directory: `cd` (its argument globbed like any
+  word, so `cd v*` lands in `vendor`), `cd -`, `pushd`/`popd`,
+  `env -C`, with `( )`, `$( )`, pipelines, `&` jobs (the whole `&&`/`||` list before the
+  `&`) and piped/backgrounded `{ }` groups not moving the parent. A `cd` that may be
+  skipped (after `&&`/`||`, inside `if`/`for`/`while`/`case`) or fail (target not a
+  directory) keeps the old directory possible too, and a write is checked against every
+  possibility. A loop body (`for`/`while`/`until`, and in PowerShell a block after `foreach`,
+  `for`, `while`, `do` or `ForEach-Object`) is read twice, so a `cd` at its end reaches the
+  writes at its start; a `cd` that only lands after three or more passes is not followed.
+  This approximates bash, it does not run it: where the outcome depends on exit statuses
+  or loop counts, the guard keeps every candidate directory, and past 8 candidates it
+  stops the call instead of guessing. It finds what these
+  write or remove: redirects, `tee`, `touch`, `truncate`, `mkdir`, `sed -i`, `dd of=`, `rm`/`rmdir`
   (and their parent dirs: `rm -rf .claude`), `mv` sources and destinations, `cp`/`install`/
-  `ln` into a dir (`cp x .claude/`, `-t`/`--target-directory`). Globs are expanded against
+  `ln` into a dir (`cp x .claude/`, `-t`/`--target-directory`), `mkdir`, and what `ln` links
+  to (a new link is a way to write its target). Globs are expanded against
   the real directory like bash does (`rm *.log` is fine, `rm -rf *` at the root is not,
   a quoted `'*'` is a literal name), braces `{a,b}` and `{1..3}` too; past 2000 expanded
   names the call is stopped rather than checked partially. It does not follow a script the agent writes and then
@@ -81,6 +87,65 @@ same treatment (`& 'C:\...\git.exe' add -A`, `Set-Content E:\repo\.claude\settin
 module-qualified cmdlets). A sweep of everyday commands (`rm -f *.log`,
 `cp .env.example .env`, heredocs, `2>&1`, `Copy-Item vendor\a src\`, here-strings,
 `2>$null`) checks that none are blocked.
+
+## Checked against real shells
+
+[`hooks/tests/differential.test.js`](../hooks/tests/differential.test.js) does not trust the
+guard's own model of a shell. Each case builds a throwaway project (read-only `vendor/`, a
+link `alias -> vendor`, `.claude` settings), generates a command out of `cd`/`pushd`, globs,
+braces, quotes, `..`, absolute paths, subshells, `if`/`for`, pipes, background jobs and some
+twenty writing commands, asks the guard, then **runs it with real bash** (Git Bash on
+Windows) or **pwsh** and diffs the tree. Each project sits deeper in its sandbox than any
+generated command can climb (`..` steps times loop passes), with a canary at the sandbox
+root that stops the run if it is ever touched. Run it in a container or a VM if you change
+the generator: it executes `rm -rf *` for real. A protected file that changed while the guard said
+nothing fails the test. Commands use only what the guard claims to follow: no `$vars`,
+`eval`, scripts or `~`.
+
+It found five kinds of miss, each fixed with a regression test:
+
+| Command (shortened) | What the guard got wrong |
+|---|---|
+| `cd v*; touch x` | did not glob a `cd` argument |
+| `mkdir vendor/x` | `mkdir` was not counted as a write |
+| `cd src && make & echo > vendor/x` | took the `cd` as moving the shell; `&` backgrounds the whole `&&` list |
+| `for i in 1 2; do touch x; cd vendor; done` | read a loop body once; the second pass runs in `vendor` |
+| `ln -s vendor/x y && echo > y` | a link made by the command itself, written through |
+
+Three review rounds on those fixes by a second model (Codex) found eleven more, and the test,
+widened to cover them, found one that dates back to v1.0. All fixed with a regression test:
+
+| Command (shortened) | What the guard got wrong |
+|---|---|
+| `cd src && { :; } & touch vendor/x` | a `;` inside a compound cut the backgrounded list short |
+| `time for ...; done`, `! for ...; done` | a prefixed loop was not read as a loop |
+| `ForEach-Object -Begin { } -Process { ... }` | the `-Process` block after `-Begin` was not read as a loop body |
+| `cd .claude; ln -sf ../src/settings.json` | one-operand `ln` links into the current dir under the source's name |
+| `false && { true; cd .claude; }; touch vendor/x` | a command inside a compound that may be skipped counted as certain (since v1.0) |
+| `cd src && ! { :; } & touch vendor/x` | a brace group after `!` was not read as a group |
+| `(case x in x) :;; esac; cd src); touch vendor/x` | the `)` ending a case pattern closed the subshell |
+| `false && { :; '}'; cd src; }; touch vendor/x` | a quoted `'}'` (or `'fi'`) closed the compound |
+| `cd src out; touch vendor/x` | `cd` with two operands fails in bash; the guard moved to the first |
+| `'!' cd src; touch vendor/x` | a quoted keyword was dropped as a keyword; bash runs a program called `!` |
+| `env cd src; touch vendor/x` | a `cd` under `env`/`nohup`/`sudo` runs in a new process (and fails); it moved the guard's shell |
+| `touch ven{d..d}or/x` | a brace that expands to a single word was not expanded |
+
+Reading the parser for the loop fix also turned up a keyword after `then`/`do`/`else`
+(`then for ...`) that did not open a body. After all fixes: **13,800 cases** (12,000 bash on
+Linux, 1,500 Git Bash and 300 pwsh on Windows), **no protected change let through**. CI
+runs a fresh seed on every push, on Ubuntu and Windows.
+
+Two choices that block on purpose: making a link to a protected path is blocked by itself
+(the link is a way to write it later), and a `for` over two or more words reads its body
+twice even when the second pass would not write (`for x in one` reads it once).
+
+On the field replay these fixes add one block: a `mkdir -p "$P"` run from inside a read-only
+dir, where `$P` held an absolute path the guard does not expand.
+
+About half the blocks in those runs touched nothing protected. That is not a false-block
+rate: the generator is built to be awkward (a `cd` that may fail, a write after it, globs
+that match nothing), and on those the guard keeps every possible directory and blocks. The
+field rate is the [measurement below](#measured-on-a-real-project).
 
 ## Layers: permission rules and the sandbox hold the line, the hook explains
 

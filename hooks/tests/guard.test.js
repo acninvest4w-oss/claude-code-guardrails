@@ -359,6 +359,63 @@ test('red team: globs are expanded against the real directory, quoted ones are l
   }
 });
 
+test('differential: cd expands its glob, mkdir writes, ln makes its target writable (found by running real bash)', (t) => {
+  const { linked, run } = realProject(t);
+  const ids = (cmd) => run(cmd).map((m) => m.match(/^\((.+?)\)/)[1]);
+  for (const cmd of ['cd v*; touch new.txt', 'cd v*\ndd if=/dev/null of=new.txt', 'cd ve?dor && echo x > n',
+    'cd {vendor,src}; touch n', 'mkdir vendor/new', 'mkdir -p ./vendor/a/b', 'cd vendor && mkdir x',
+    'ln -s vendor/new.txt n && printf y > n', 'ln vendor/a.txt x; echo y > x', 'ln -s ../vendor src/v',
+    'cd vendor; ln -sf ../src/a.log']) {
+    assert.ok(ids(cmd).includes('readonly-dir'), cmd);
+  }
+  assert.ok(ids('mkdir -p .claude/settings.json').includes('guard-config'));
+  assert.ok(ids('cd .claude; ln -sf ../src/a.log settings.json').includes('guard-config'));
+  if (linked) assert.ok(ids('mkdir alias/new').includes('readonly-dir'));
+  for (const cmd of ['cd s*; touch new.txt', "cd 'v*'; touch n", 'mkdir -p src/new out', 'cd src && mkdir x',
+    'ln -s ../src/a.log src/b.log', 'ln -sf node_modules/.bin/tool tool']) {
+    assert.deepStrictEqual(run(cmd), [], cmd);
+  }
+});
+
+test('differential: a loop body runs again from where it left off, & backgrounds a whole list', (t) => {
+  const { root, run } = realProject(t);
+  const self = path.basename(root);
+  const blocked = (cmd) => run(cmd).some((m) => /^\((readonly-dir|guard-config)\)/.test(m));
+  for (const cmd of ['for i in 1 2; do touch new.txt; cd vendor; done', 'while true; do rm -f *.txt; cd v*; done',
+    'for i in 1 2; do (touch x); cd vendor; done', 'if true; then for i in 1; do :; done; cd vendor; fi; touch y',
+    `if false; then for i in 1; do :; done; cd src; fi; touch ../${self}/vendor/x`,
+    '( cd src && cat a > b & echo x > src/../vendor/new.txt )', 'cd src && make & touch vendor/x',
+    // Codex round 5: a ; inside a compound does not cut the backgrounded list; prefixed loops
+    'cd src && { :; } & touch vendor/x', 'cd src && if true; then :; fi & touch vendor/x',
+    'time for i in 1 2; do touch x; cd vendor; done', '! for i in 1 2; do touch x; cd vendor; done',
+    'time -p for i in 1 2; do touch x; cd vendor; done',
+    // every command inside a compound that may be skipped may itself not run (since v1.0)
+    'false && { true; cd .claude; }; touch vendor/x', 'true || { ls; cd src; ls; }; touch vendor/x',
+    // Codex round 6: prefixed group, case-pattern ")", quoted keywords, cd with two operands
+    'cd src && ! { :; } & touch vendor/x', '(case x in x) :;; esac; cd src); touch vendor/x',
+    '( case a in (a) cd src;; esac ); touch vendor/v', "false && { :; '}'; cd src; }; touch vendor/x",
+    "if false; then 'fi'; cd src; fi; touch vendor/x", 'cd src .claude; touch vendor/x',
+    // Codex round 7: a quoted keyword is a command, cd under env/nohup moves nothing, a lone brace variant
+    "'!' cd src; touch vendor/x", "'if' cd src; touch vendor/x", 'env cd src; touch vendor/x',
+    'nohup cd src; touch vendor/x', 'touch ven{d..d}or/x']) {
+    assert.ok(blocked(cmd), cmd);
+  }
+  for (const cmd of ['for f in a b; do cd src; ls; cd ..; done; touch x.txt', 'cd vendor && ls & touch src/x',
+    'for d in src out; do (cd $d && ls); done', '{ cd vendor; ls; } & touch src/x',
+    'for i in 1; do touch x; cd vendor; done', 'for i in 1 2; do cd vendor; done | cat; touch x',
+    'case "$x" in a|b) echo hi ;; *) echo no ;; esac > src/log', 'cd vendor src; touch x',
+    'command cd src; touch x', 'time cd src; touch x']) {
+    assert.deepStrictEqual(run(cmd), [], cmd);
+  }
+  const ps = (command) => checkPre({ tool_name: 'PowerShell', tool_input: { command }, cwd: root },
+    opts({ env: { CLAUDE_PROJECT_DIR: root }, config: { readonly: ['vendor/'] } }));
+  assert.ok(ps('1,2 | ForEach-Object { Set-Content new.txt x; Set-Location vendor }').length);
+  assert.ok(ps('for ($i = 0; $i -lt 2; $i++) { Set-Content new.txt x; cd vendor }').length);
+  assert.ok(ps('1,2 | ForEach-Object -Begin { } -Process { Set-Content x a; Set-Location vendor }').length);
+  assert.deepStrictEqual(ps('foreach ($i in 1,2) { cd src; Get-ChildItem; cd .. }'), []);
+  assert.deepStrictEqual(ps('if ($true) { Set-Content new.txt x }; cd vendor'), []);
+});
+
 test('red team: cwd follows the shell exactly -- subshells, pipelines, pushd/popd, cd -', () => {
   const guarded = (cmd) => checkPre(bash(cmd), opts()).some((m) => m.startsWith('(guard-config)'));
   for (const cmd of ['cd /tmp > .claude/settings.json', '(cd /tmp); printf x > .claude/settings.json',
