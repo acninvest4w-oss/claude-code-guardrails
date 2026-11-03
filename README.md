@@ -41,7 +41,7 @@ Most rules exist because an agent did exactly that thing on a live project.
 ## Quick start
 
 ```bash
-git clone --branch v1.3.0 https://github.com/acninvest4w-oss/claude-code-guardrails ~/claude-code-guardrails
+git clone --branch v1.3.1 https://github.com/acninvest4w-oss/claude-code-guardrails ~/claude-code-guardrails
 cd /path/to/your/project
 mkdir -p .claude/hooks .claude/agents
 cp ~/claude-code-guardrails/hooks/guard.js .claude/hooks/
@@ -186,7 +186,7 @@ in sync, and going back is checking out the old tag.
 
 ```bash
 git clone https://github.com/acninvest4w-oss/claude-code-guardrails C:/tools/claude-code-guardrails
-git -C C:/tools/claude-code-guardrails checkout v1.3.0      # update: fetch --tags, checkout the new tag
+git -C C:/tools/claude-code-guardrails checkout v1.3.1      # update: fetch --tags, checkout the new tag
 git -C C:/tools/claude-code-guardrails describe --tags      # what this machine runs
 ```
 
