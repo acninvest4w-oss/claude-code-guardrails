@@ -26,7 +26,7 @@ Most rules exist because an agent did exactly that thing on a live project.
 - **Real CLI.** [`e2e/smoke.py`](e2e/smoke.py) asks Claude to break each rule in a throwaway
   project: 13 hook checks over Bash and PowerShell, 3 gate checks. A refusal counts only
   from the hook's own log or the CLI's tool result, never from what the model says.
-  Runs in the open: [v1.3.0, Ubuntu, 12/12](https://github.com/acninvest4w-oss/claude-code-guardrails/actions/runs/41594073182).
+  Runs in the open: [Ubuntu 12/12, Windows 16/16, CLI 2.1.317](https://github.com/acninvest4w-oss/claude-code-guardrails/actions/runs/41595632590).
 - **Attacked on purpose.** 11 rounds of adversarial review by a second model: each bypass
   it found is fixed with a regression test or listed under the limits. A seeded fuzz suite
   checks properties for both shells. CI runs it all on Ubuntu and Windows.
