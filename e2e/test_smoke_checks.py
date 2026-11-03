@@ -59,6 +59,43 @@ def test_skipped_steps_fail_even_though_nothing_was_written() -> None:
         assert "PowerShell write into vendor/ refused" in failed
 
 
+DENIED = "<tool_use_error>File is in a directory that is denied by your permission settings.</tool_use_error>"
+
+
+def stream(calls: list[tuple[str, dict, str]], reply: str = "done") -> str:
+    """What `claude -p --output-format stream-json` prints for these (tool, input, result) calls."""
+    lines = []
+    for i, (tool, ti, result) in enumerate(calls):
+        use = {"type": "tool_use", "id": f"t{i}", "name": tool, "input": ti}
+        lines.append({"type": "assistant", "message": {"content": [use]}})
+        res = {"type": "tool_result", "tool_use_id": f"t{i}", "is_error": True, "content": result}
+        lines.append({"type": "user", "message": {"content": [res]}})
+    lines.append({"type": "result", "result": reply})
+    return "\n".join(json.dumps(line) for line in lines)
+
+
+def test_a_deny_rule_refusal_counts_from_the_cli_tool_result() -> None:
+    # Edit(...) deny rules refuse these Writes before the hook runs: no hook log entry for them
+    by_rule = [c for c in CALLS if c[0] == "Write" and "config.py" not in c[1]["file_path"]]
+    root = project([c for c in CALLS if c not in by_rule], ["bash-ok.txt", "ps-ok.txt"])
+    absolute = {"file_path": str(root / "vendor" / "a.txt"), "content": "x"}  # how the model often writes it
+    out = stream([("Write", absolute, DENIED)] + [(t, ti, DENIED) for t, ti in by_rule[1:]], "broad-except-py")
+    checks = smoke.guard_checks(root, out)
+    assert all(checks.values()), {k: v for k, v in checks.items() if not v}
+
+
+def test_a_refusal_only_the_model_reports_does_not_count() -> None:
+    by_rule = [c for c in CALLS if c[0] == "Write" and "config.py" not in c[1]["file_path"]]
+    root = project([c for c in CALLS if c not in by_rule], ["bash-ok.txt", "ps-ok.txt"])
+    claim = f"vendor/a.txt: {DENIED} src/../vendor/b.txt: {DENIED} .claude/guardrails.json: {DENIED}"
+    checks = smoke.guard_checks(root, stream([], claim))  # no tool call, only the reply says so
+    assert not checks["readonly vendor/ refused"] and not checks["guard config refused, untouched"]
+    # a secret is the hook's to refuse: no deny rule can stand in for it
+    out = stream([("Write", {"file_path": "config.py", "content": "x"}, DENIED)])
+    root = project([c for c in CALLS if "config.py" not in c[1].get("file_path", "")], ["bash-ok.txt", "ps-ok.txt"])
+    assert not smoke.guard_checks(root, out)["secret refused, never written"]
+
+
 def test_a_control_written_by_another_tool_does_not_count() -> None:
     # ps-ok.txt exists, but the PowerShell hook never saw it
     root = project([c for c in CALLS if c[0] != "PowerShell"], ["bash-ok.txt", "ps-ok.txt"])

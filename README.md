@@ -276,10 +276,15 @@ The example settings ship both layers:
   and pathspecs. If you add one on Windows with Git Bash, add the matching `PowerShell(...)`
   rule too: **any Bash deny turns the PowerShell tool off for the session, silently**
   ([tools reference](https://code.claude.com/docs/en/tools-reference.md#bash-deny-rules-also-turn-off-the-powershell-tool)).
-- **The hook** keeps everything above as a second check (it runs before permission rules,
-  [hooks](https://code.claude.com/docs/en/hooks.md#exit-code-output)) and adds what no rule
-  expresses: PowerShell cmdlet writes, `cd`/`Set-Location` tracking, links and `..`,
-  secrets in content, the per-language warnings, and the reason the model reads.
+- **The hook** keeps everything above as a second check and adds what no rule expresses.
+  Order matters: a hook that exits 2 stops a Bash or PowerShell call before permission
+  rules are evaluated ([permissions](https://code.claude.com/docs/en/permissions.md)), but
+  an `Edit(...)` deny refuses a Write or Edit on its path before PreToolUse hooks run
+  (seen with Claude Code 2.1.88): there the rule is the check, the model reads the rule's
+  "denied by your permission settings", and the hook is the backstop if the rule is
+  removed. What the hook adds: PowerShell cmdlet writes, `cd`/`Set-Location` tracking,
+  links and `..`, secrets in content, the per-language warnings, and the reason the model
+  reads.
 
 ### Measured on a real project
 
@@ -349,8 +354,9 @@ never hide it; every spelling of a protected path (quotes, escapes, `..`, `//`, 
 Windows, `\`, `/c/`, `FileSystem::`) blocks; verdicts do not depend on earlier calls.
 CI runs the unit tests and the fuzz suite on Ubuntu and Windows on every push. The end-to-end smoke test
 ([`e2e/smoke.py`](e2e/smoke.py)) runs the real CLI: hooks wired into a throwaway project
-with Claude asked to break each rule (verdicts read from the filesystem and git index,
-not from the model's reply), then the gate fixing a real bug with the test file checked
+with Claude asked to break each rule (verdicts read from the filesystem, the git index,
+the hook's own log and the CLI's tool results, not from the model's reply; a step refused
+by an `Edit(...)` deny counts only with the CLI's "denied" result for that call), then the gate fixing a real bug with the test file checked
 byte-for-byte. It runs on demand via the `e2e` workflow with an `ANTHROPIC_API_KEY` secret.
 
 ## Tiếng Việt
